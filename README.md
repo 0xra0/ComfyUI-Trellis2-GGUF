@@ -1,144 +1,162 @@
-# 🌀 ComfyUI Wrapper for [https://github.com/microsoft/TRELLIS.2](https://github.com/microsoft/TRELLIS.2)
+# 🌀 ComfyUI-Trellis2-GGUF — Local ROCm Fork (0xra0)
+
+> **Base:** [Aero-Ex/ComfyUI-Trellis2-GGUF](https://github.com/Aero-Ex/ComfyUI-Trellis2-GGUF)  
+> **Branch:** `local-rocm` — AMD ROCm / gfx1030 (RX 6800) patches on top of upstream.
+
+ComfyUI custom node wrapping [microsoft/TRELLIS.2](https://github.com/microsoft/TRELLIS.2) with GGUF quantization support.  
+This fork adds ROCm-specific stability fixes, Pixal3D MultiView projected-conditioning, safe bake, sparse VAE fixes, and a cascade coordinate scaling fix — all targeting 16 GB VRAM on AMD gfx1030.
 
 ---
 
-<img width="883" height="566" alt="{09272892-57D6-4EB8-B27B-6B875916982A}" src="https://github.com/user-attachments/assets/a7788f13-141c-4072-9143-b8b1ee1ead2a" />
+## What's Different from Upstream
+
+### Commit: `local-rocm-20261015` — Local ROCm fixes
+
+Large patch covering the full ROCm compatibility layer:
+
+| File | Change |
+|---|---|
+| `__init__.py` | ROCm-safe initialisation guards |
+| `model_manager.py` | GGUF loader fixes for ROCm device placement |
+| `nodes.py` | Pixal3D MultiView loader node; ROCm-safe node registrations |
+| `rocm_safe_bake.py` | *(new)* Safe texture bake path that avoids ROCm allocator crashes |
+| `trellis2_gguf/leak_probe.py` | *(new)* Debug utility to probe VRAM leak sources |
+| `trellis2_gguf/models/__init__.py` | Model registry fixes |
+| `trellis2_gguf/models/sc_vaes/fdg_vae.py` | FDG VAE dtype/device fixes |
+| `trellis2_gguf/models/sc_vaes/sparse_unet_vae.py` | Sparse UNet VAE stability on ROCm |
+| `trellis2_gguf/modules/attention/full_attn.py` | SDPA fallback for ROCm (no Flash Attention) |
+| `trellis2_gguf/modules/sparse/attention/full_attn.py` | Sparse full attention ROCm fix |
+| `trellis2_gguf/modules/sparse/attention/proj_attention.py` | Fix `proj_context=None` / `ProjectAttention` crash |
+| `trellis2_gguf/modules/sparse/conv/conv_flex_gemm.py` | FlexGEMM conv ROCm path |
+| `trellis2_gguf/modules/sparse/spatial/spatial2channel.py` | Spatial-to-channel op fix |
+| `trellis2_gguf/pipelines/samplers/flow_euler.py` | Euler sampler stability |
+| `trellis2_gguf/pipelines/trellis2_image_to_3d.py` | Pixal3D MultiView camera-projected conditioning; NAF tiled path; sparse-only feature tensors |
+| `trellis2_gguf/utils/uv_rasterizer.py` | *(new)* UV rasterizer utility |
+
+### Commit: `f90452a` — Cascade coordinate scaling fix
+
+Fixes 1024/1536/2048/4096 cascade pipelines on Pixal3D:
+
+> Pixal3D's sparse structure is 64³, so upsampled LR coords span 0..1023, but the cascade divided them by a hardcoded `lr_resolution=512`. Every HR coord doubled past the 64³ lattice (max 126), and the dual-grid mesher found almost no faces (182k vertices, 488 faces → a 150-face fragment after cleanup). Fix: use the already-computed `sparse_ratio` and pass `sparse_structure_resolution` from `run()`.
+
+**Unstaged additions** (also active in the working tree):
+
+- `nodes.py` — additional MultiView node fixes
+- `trellis2_gguf/leak_probe.py` — extended VRAM leak probe
+- `trellis2_gguf/pipelines/trellis2_image_to_3d.py` — further MultiView conditioning tweaks
 
 ---
 
-<img width="980" height="579" alt="{F6FE6B7B-94B7-44C6-8C89-02E7C81EBF7E}" src="https://github.com/user-attachments/assets/ad27111c-beb8-48ef-8613-c533a3a5cacd" />
+## Hardware Target
+
+| Component | Spec |
+|---|---|
+| GPU | AMD Radeon RX 6800 (gfx1030) |
+| VRAM | 16 GB |
+| ROCm | 6.x / 7.x |
+| Python | 3.12 |
+| PyTorch | ROCm build |
 
 ---
 
-## 📋 Changelog
+## Installation
 
-| Date | Description |
-| --- | --- |
-| **2026-02-21** | Fixed "Vertical lines" bug |
-| **2026-02-17** | Disabled Triton Cache (trying to fix vertical lines bug)<br>Fixed "Weld Vertices"<br>Added "Reconstruct Mesh with Quad" node |
-| **2026-02-13** | Added the node "Weld Vertices"<br>Added the resolution 1536 for "Mesh Texturing" |
-| **2026-02-12** | Added the node "Mesh With Voxel Multi-View Generator" |
-|| Added the node "Mesh Texturing Multi-View" |
-|| Added new example workflows |
-| **2026-02-10** | Improved progress bar when filling holes with meshlib |
-| **2026-02-09** | Fixed "Mesh Texturing" node<br>"mesh_cluster_threshold_cone_half_angle_rad" was not used |
-| **2026-02-08** | Fixed "Fill Holes" node progress bar<br>Updated Cumesh package<br>Added "Remesh with Quad" node<br>Added "Batch Simplify Mesh and Export" node|
-| **2026-02-07** | Updated Cumesh package<br>Improved "Remesh" node when removing inner layer|
-| **2026-02-02** | Added node "Smooth Normals"<br>Useful for "Low Poly" mesh to remove the "blocky" aspect|
-|| Added "remove_background" parameter for "PreProcess Image" node<br>Using rembg package|
-| **2026-01-30** | Updated Cumesh, updated nodes, updated workflows|
-||PostProcess UnWrap and Rasterize : removed fill_holes_max_perimeter <br> using fill holes from Meshlib|
-||Remesh : added "remove_inner_faces" -> same algorithm as "Reconstruct Mesh"|
-||Mesh Texturing: added "mesh_cluster_threshold_cone_half_angle_rad"|
-| **2026-01-29** |Updated cumesh -> Remesh and Reconstruct made by chunk|
-| **2026-01-28** |Added the node "Fill Holes With Meshlib"|
-||Trying to fix caching issue|
-| **2026-01-27** |Added the node "Trellis2ReconstructMesh"|
-||"Multiple Images" support for "Mesh Refiner" node|
-| **2026-01-21** |Added a "Continue" node|
-||Added the option "bake_on_vertices" for "Mesh Texturing" node|
-||Added "padding" option for "Preprocess Image" node|
-| **2026-01-20** |Added node "Simplify Trimesh"|
-||Fixed crash with "remove_infinite_vertices" in "PostProcess Mesh" node|
-||Fixed texture generation|
-| **2026-01-19** |Updated Cumesh|
-| **2026-01-12** |Can pass multiple images to "Mesh Texturing" node (experimental)|
-||Applied latest fixes from Microsoft|
-| **2026-01-05** |Implemented "Tiled" Decoder|
-||Updated Cumesh and O_voxel|
+### Prerequisites
 
----
+- ComfyUI installed and running (see [0xra0/ComfyUI](https://github.com/0xra0/ComfyUI) for the matching ROCm-tuned base)
+- ROCm 6+ drivers
+- Python 3.12 environment used for ComfyUI
 
-## REQUIREMENTS ##
+### 1. Clone into custom_nodes
 
-You need to have access to facebook dinov3 models in order to use Trellis.2
-
-[https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m)
-
-Clone the repository in ComfyUI models folder under "facebook/dinov3-vitl16-pretrain-lvd1689m"
-
-So in ComfyUI/models/facebook/dinov3-vitl16-pretrain-lvd1689m
-
----
-
-## ⚙️ Installation Guide
-
-> Tested on **Windows 11** with **Python 3.11** and **Torch = 2.7.0 + cu128**.
-
-### 1. Install Wheels
-
-#### For a standard python environment:
-
-**If you use Torch v2.7.0:**
 ```bash
-python -m pip install ComfyUI/custom_nodes/ComfyUI-Trellis2/wheels/Windows/Torch270/cumesh-0.0.1-cp311-cp311-win_amd64.whl
-python -m pip install ComfyUI/custom_nodes/ComfyUI-Trellis2/wheels/Windows/Torch270/nvdiffrast-0.4.0-cp311-cp311-win_amd64.whl
-python -m pip install ComfyUI/custom_nodes/ComfyUI-Trellis2/wheels/Windows/Torch270/nvdiffrec_render-0.0.0-cp311-cp311-win_amd64.whl
-python -m pip install ComfyUI/custom_nodes/ComfyUI-Trellis2/wheels/Windows/Torch270/flex_gemm-0.0.1-cp311-cp311-win_amd64.whl
-python -m pip install ComfyUI/custom_nodes/ComfyUI-Trellis2/wheels/Windows/Torch270/o_voxel-0.0.1-cp311-cp311-win_amd64.whl
+cd /path/to/ComfyUI/custom_nodes
+git clone https://github.com/0xra0/ComfyUI-Trellis2-GGUF.git
+cd ComfyUI-Trellis2-GGUF
+git checkout local-rocm
 ```
 
-**If you use Torch v2.8.0:**
+### 2. Install requirements
+
 ```bash
-python -m pip install ComfyUI/custom_nodes/ComfyUI-Trellis2/wheels/Windows/Torch280/cumesh-0.0.1-cp311-cp311-win_amd64.whl
-python -m pip install ComfyUI/custom_nodes/ComfyUI-Trellis2/wheels/Windows/Torch280/nvdiffrast-0.4.0-cp311-cp311-win_amd64.whl
-python -m pip install ComfyUI/custom_nodes/ComfyUI-Trellis2/wheels/Windows/Torch280/nvdiffrec_render-0.0.0-cp311-cp311-win_amd64.whl
-python -m pip install ComfyUI/custom_nodes/ComfyUI-Trellis2/wheels/Windows/Torch280/flex_gemm-0.0.1-cp311-cp311-win_amd64.whl
-python -m pip install ComfyUI/custom_nodes/ComfyUI-Trellis2/wheels/Windows/Torch280/o_voxel-0.0.1-cp311-cp311-win_amd64.whl
+pip install -r requirements.txt
 ```
 
----
+> [!NOTE]
+> This node requires the TRELLIS.2 dependencies. On ROCm, Flash Attention is not available — the node falls back to SDPA automatically.
 
-#### For ComfyUI Portable:
+### 3. Download models
 
-**If you use Torch v2.7.0:**
+**GGUF Pixal3D weights** (place under `ComfyUI/models/Pixal3D-GGUF/`):
+- Pixal3D-GGUF Q8_0 weights (from the upstream node's model page)
+
+**DINOv3** (required by Trellis2):
 ```bash
-python_embeded\python.exe -m pip install ComfyUI\custom_nodes\ComfyUI-Trellis2\wheels\Windows\Torch270\cumesh-0.0.1-cp311-cp311-win_amd64.whl
-python_embeded\python.exe -m pip install ComfyUI\custom_nodes\ComfyUI-Trellis2\wheels\Windows\Torch270\nvdiffrast-0.4.0-cp311-cp311-win_amd64.whl
-python_embeded\python.exe -m pip install ComfyUI\custom_nodes\ComfyUI-Trellis2\wheels\Windows\Torch270\nvdiffrec_render-0.0.0-cp311-cp311-win_amd64.whl
-python_embeded\python.exe -m pip install ComfyUI\custom_nodes\ComfyUI-Trellis2\wheels\Windows\Torch270\flex_gemm-0.0.1-cp311-cp311-win_amd64.whl
-python_embeded\python.exe -m pip install ComfyUI\custom_nodes\ComfyUI-Trellis2\wheels\Windows\Torch270\o_voxel-0.0.1-cp311-cp311-win_amd64.whl
-```
-
-**If you use Torch v2.8.0:**
-```bash
-python_embeded\python.exe -m pip install ComfyUI\custom_nodes\ComfyUI-Trellis2\wheels\Windows\Torch280\cumesh-0.0.1-cp311-cp311-win_amd64.whl
-python_embeded\python.exe -m pip install ComfyUI\custom_nodes\ComfyUI-Trellis2\wheels\Windows\Torch280\nvdiffrast-0.4.0-cp311-cp311-win_amd64.whl
-python_embeded\python.exe -m pip install ComfyUI\custom_nodes\ComfyUI-Trellis2\wheels\Windows\Torch280\nvdiffrec_render-0.0.0-cp311-cp311-win_amd64.whl
-python_embeded\python.exe -m pip install ComfyUI\custom_nodes\ComfyUI-Trellis2\wheels\Windows\Torch280\flex_gemm-0.0.1-cp311-cp311-win_amd64.whl
-python_embeded\python.exe -m pip install ComfyUI\custom_nodes\ComfyUI-Trellis2\wheels\Windows\Torch280\o_voxel-0.0.1-cp311-cp311-win_amd64.whl
+# Clone into ComfyUI/models/facebook/
+git clone https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m \
+  /path/to/ComfyUI/models/facebook/dinov3-vitl16-pretrain-lvd1689m
 ```
 
 ---
 
-**Check the folder wheels for the other versions**
+## Usage
 
----
+### Pixal3D MultiView (ROCm-fixed path)
 
-### 2. Custom Build
+This fork's key addition is the **camera-projected MultiView conditioning** for Pixal3D-GGUF.
 
-#### o_voxel
+Recommended node settings:
 
-Use my own version of Trellis.2 here: https://github.com/visualbruno/TRELLIS.2
+| Setting | Value |
+|---|---|
+| Model | Pixal3D-GGUF |
+| Format | GGUF Q8\_0 |
+| Backend | `sdpa` |
+| Device | `cuda` (ROCm) |
+| `low_vram` | `true` |
+| Views | front, back, left, right |
+| `pipeline_type` | `512` |
+| `sparse_structure_resolution` | `32` |
+| Sparse steps | 4 |
+| Shape steps | 4 |
 
-#### Cumesh 
-
-Use my own version of Cumesh here: https://github.com/visualbruno/CuMesh
-
----
-
-### 3. Requirements.txt
-
-#### For a standard python environment:
-
-```bash
-python -m pip install -r ComfyUI/custom_nodes/ComfyUI-Trellis2/requirements.txt
+Expected log markers confirming the fixed path is active:
+```
+[Pixal3D-GGUF MV] Using camera-projected conditioning
+[Pixal3D MV] views=['front', 'left', 'back', 'right']
+[Sparse] occupied tokens after shell=...
 ```
 
+> [!TIP]
+> Keep `generate_texture_slat = false` on first tests to save VRAM. Enable once sparse generation looks correct.
+
+### Safe Bake
+
+`rocm_safe_bake.py` provides a texture bake path that avoids the ROCm allocator crashes seen with the upstream bake on gfx1030. It is called automatically when baking is requested on a ROCm device.
+
 ---
 
-#### For ComfyUI Portable:
+## Rebasing onto New Upstream
+
+This branch is designed to stay rebaseable:
 
 ```bash
-python_embeded\python.exe -m pip install -r ComfyUI\custom_nodes\ComfyUI-Trellis2\requirements.txt
+git remote add upstream https://github.com/Aero-Ex/ComfyUI-Trellis2-GGUF.git
+git fetch upstream
+git rebase upstream/main
 ```
+
+The commit message notes: *"Rebase onto new upstream with: `git pull` (pull.rebase=true)."*
+
+---
+
+## Relationship to Upstream
+
+This is a personal hardware-specific fork of [Aero-Ex/ComfyUI-Trellis2-GGUF](https://github.com/Aero-Ex/ComfyUI-Trellis2-GGUF).  
+Bug reports for the ROCm patches belong here. Everything else belongs upstream.
+
+---
+
+## License
+
+Same license as upstream — see [LICENSE](LICENSE) if present, otherwise the upstream repository's license applies.

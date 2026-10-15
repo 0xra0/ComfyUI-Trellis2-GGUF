@@ -2689,7 +2689,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 hr_coords[:, :1],
                 (
                     (hr_coords[:, 1:] + 0.5)
-                    / lr_resolution
+                    # LR coords live on a (16 * sparse_structure_resolution) grid:
+                    # 512 for a 32^3 SS, 1024 for Pixal3D's 64^3 SS.  Dividing by a
+                    # bare 512 doubled every HR coord past the 64^3 lattice
+                    # (max 126) and the mesher found no faces.
+                    / (lr_resolution * sparse_ratio)
                     * (grid_res - 1)
                 ).round().int(),
             ], dim=1)
@@ -3529,6 +3533,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 512, 1024,
                 coords, shape_slat_sampler_params,
                 max_num_tokens,
+                sparse_structure_resolution=sparse_structure_resolution,
                 sampler=shape_sampler or sampler,
                 proj_image_cond_model=shape_1024_model if ss_attn_mode == 'proj' else None,
                 proj_images=images if ss_attn_mode == 'proj' else None,
@@ -3576,6 +3581,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 512, 2048,
                 coords, shape_slat_sampler_params,
                 max_num_tokens,
+                sparse_structure_resolution=sparse_structure_resolution,
                 sampler=shape_sampler or sampler,
                 proj_image_cond_model=shape_1024_model if ss_attn_mode == 'proj' else None,
                 proj_images=images if ss_attn_mode == 'proj' else None,
@@ -3612,6 +3618,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 512, 4096,
                 coords, shape_slat_sampler_params,
                 max_num_tokens,
+                sparse_structure_resolution=sparse_structure_resolution,
                 sampler=shape_sampler or sampler,
                 proj_image_cond_model=shape_1024_model if ss_attn_mode == 'proj' else None,
                 proj_images=images if ss_attn_mode == 'proj' else None,
@@ -3648,6 +3655,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 512, 1536,
                 coords, shape_slat_sampler_params,
                 max_num_tokens,
+                sparse_structure_resolution=sparse_structure_resolution,
                 sampler=shape_sampler or sampler,
                 proj_image_cond_model=shape_1024_model if ss_attn_mode == 'proj' else None,
                 proj_images=images if ss_attn_mode == 'proj' else None,
