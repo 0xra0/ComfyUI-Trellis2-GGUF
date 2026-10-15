@@ -1,4 +1,5 @@
 from typing import *
+import os
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -6,6 +7,78 @@ from easydict import EasyDict as edict
 from .base import Sampler
 from .classifier_free_guidance_mixin import ClassifierFreeGuidanceSamplerMixin
 from .guidance_interval_mixin import GuidanceIntervalSamplerMixin
+from ...modules.sparse import config as sparse_config
+
+
+def _host_bad(x):
+    """Non-finite count of a (Sparse)Tensor or tuple, counted on the host."""
+    if isinstance(x, (tuple, list)):
+        return sum(_host_bad(e) for e in x)
+    f = getattr(x, "feats", x)
+    if not torch.is_tensor(f) or not f.is_floating_point():
+        return 0
+    return int((~torch.isfinite(f.detach().cpu())).sum())
+
+
+def _hr_determinism(run_step, first, inputs):
+    """TRELLIS2_HR_DETERMINISM=1: fingerprint the conditioning, then repeat step 0.
+
+    The fingerprints compare runs (does the conditioning differ between a good
+    and a bad run?); the repeat compares within a run (is the forward itself
+    reproducible on identical inputs?).
+    """
+    import hashlib
+
+    def walk(x, path):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                walk(v, f"{path}.{k}")
+        elif isinstance(x, (list, tuple)):
+            for i, v in enumerate(x):
+                walk(v, f"{path}[{i}]")
+        else:
+            f = getattr(x, "feats", x)
+            if torch.is_tensor(f):
+                h = f.detach().float().cpu().contiguous()
+                print(f"[HR determinism] {path}: shape={tuple(h.shape)} "
+                      f"sha={hashlib.sha256(h.numpy().tobytes()).hexdigest()[:16]} "
+                      f"bad={int((~torch.isfinite(h)).sum())} std={float(h[torch.isfinite(h)].std()):.6f}")
+
+    walk(inputs, "in")
+    ref = first.pred_x_0.feats.detach().cpu()
+    for rep in range(2):
+        again = run_step().pred_x_0.feats.detach().cpu()
+        print(f"[HR determinism] step-0 repeat {rep + 1}: max|diff|={float((again - ref).abs().max()):.3e} "
+              f"std first={float(ref.std()):.6f} repeat={float(again.std()):.6f}")
+
+
+def _hr_nan_probe(run_step, model):
+    """TRELLIS2_HR_NAN_PROBE=1: rerun a step that went non-finite.
+
+    Pass 1 repeats it unchanged: finite now means the failure is not a
+    deterministic function of the inputs. Pass 2 hooks every module and prints
+    the first ones whose output is non-finite, in execution order.
+    """
+    out = run_step()
+    print(f"[HR NaN probe] rerun: pred_x0 bad={_host_bad(out.pred_x_0):,}, "
+          f"pred_x_prev bad={_host_bad(out.pred_x_prev):,}")
+    hits, handles = [], []
+    for name, mod in model.named_modules():
+        def hook(m, inp, o, name=name):
+            if len(hits) < 12:
+                ob = _host_bad(o)
+                if ob:
+                    hits.append(f"{name or '<model>'} ({type(m).__name__}): "
+                                f"in bad={_host_bad(inp):,} out bad={ob:,}")
+        handles.append(mod.register_forward_hook(hook))
+    try:
+        out = run_step()
+    finally:
+        for h in handles:
+            h.remove()
+    print(f"[HR NaN probe] hooked rerun: pred_x0 bad={_host_bad(out.pred_x_0):,}")
+    for h in hits:
+        print("[HR NaN probe]   first bad:", h)
 
 
 class FlowEulerSampler(Sampler):
@@ -42,7 +115,11 @@ class FlowEulerSampler(Sampler):
         return ((1 - self.sigma_min) * x_t - x_0) / (self.sigma_min + (1 - self.sigma_min) * t)
 
     def _inference_model(self, model, x_t, t, cond=None, **kwargs):
-        t = torch.tensor([1000 * t] * x_t.shape[0], device=x_t.device, dtype=torch.float32)
+        t = torch.tensor(
+            [1000 * t] * x_t.shape[0],
+            device=x_t.device,
+            dtype=torch.float32,
+        )
         return model(x_t, t, cond, **kwargs)
 
     def _get_model_prediction(self, model, x_t, t, cond=None, **kwargs):
@@ -117,15 +194,134 @@ class FlowEulerSampler(Sampler):
         t_seq = t_seq.tolist()
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
-        for step_i, (t, t_prev) in enumerate(tqdm(t_pairs, desc=tqdm_desc, disable=not verbose)):
-            out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
-            sample = out.pred_x_prev
-            ret.pred_x_t.append(out.pred_x_prev)
-            ret.pred_x_0.append(out.pred_x_0)
-            if tqdm_desc == "Sampling sparse structure" and step_i % 4 == 0:
-                x0 = out.pred_x_0
-                print(f"  [SS step {step_i:2d}] t={t:.3f} pred_x0: mean={x0.mean():.4f}, std={x0.std():.4f}, max={x0.max():.4f}, min={x0.min():.4f}")
-        ret.samples = sample
+
+        # The Q8 GGUF weights stay quantized.  Changing SLatFlowModel.dtype only
+        # changes the dtype used for dequantized matmuls / activations.  Do NOT
+        # call model.convert_to() after GGUF loading: that routine was designed
+        # for ordinary parameters and would mutate quantized parameter storage.
+        _debug_hr = tqdm_desc == "Sampling shape SLat (HR)"
+        _is_rocm = getattr(torch.version, "hip", None) is not None
+        _force_hr_fp32 = (
+            _debug_hr
+            and _is_rocm
+            and os.environ.get("TRELLIS2_ROCM_HR_FP32", "1") == "1"
+            and hasattr(model, "dtype")
+        )
+        _previous_hr_dtype = None
+        if _force_hr_fp32 and model.dtype != torch.float32:
+            _previous_hr_dtype = model.dtype
+            model.dtype = torch.float32
+            print(
+                "[HR sampler ROCm] forcing FP32 activations/dequantized "
+                f"matmuls: {_previous_hr_dtype} -> {model.dtype}; "
+                "GGUF weights remain quantized"
+            )
+
+        # Keep lower-resolution sparse attention unchanged, but use the
+        # deterministic chunked torch-SDPA path for the 1024 HR model.
+        # sparse.config intentionally does not accept ATTN_BACKEND=sdpa at
+        # startup, so this must be switched explicitly for this call.
+        _previous_sparse_attn = None
+        _hr_attn_backend = os.environ.get(
+            "TRELLIS2_ROCM_HR_ATTN",
+            "sdpa",
+        ).strip().lower()
+        _force_hr_sdpa = (
+            _debug_hr
+            and _is_rocm
+            and _hr_attn_backend == "sdpa"
+        )
+        if _force_hr_sdpa:
+            _previous_sparse_attn = sparse_config.ATTN
+            sparse_config.ATTN = "sdpa"
+            print(
+                "[HR sampler ROCm] sparse attention backend: "
+                f"{_previous_sparse_attn} -> sdpa (HR call only)"
+            )
+
+        def _diag_feats(x):
+            f = x.feats if hasattr(x, "feats") else x
+            f = f.detach().float()
+            total = int(f.numel())
+            finite = int(torch.isfinite(f).sum().item())
+            if finite:
+                good = f[torch.isfinite(f)]
+                return (
+                    finite, total,
+                    float(good.min().item()),
+                    float(good.max().item()),
+                    float(good.mean().item()),
+                    float(good.std(unbiased=False).item()),
+                )
+            return finite, total, float("nan"), float("nan"), float("nan"), float("nan")
+
+        try:
+            for step_i, (t, t_prev) in enumerate(tqdm(t_pairs, desc=tqdm_desc, disable=not verbose)):
+                debug_hr = _debug_hr
+    
+                if debug_hr:
+                    fi, ft, fmin, fmax, fmean, fstd = _diag_feats(sample)
+                    print(
+                        f"  [HR step {step_i:2d} INPUT] t={t:.6f}->{t_prev:.6f} "
+                        f"finite={fi:,}/{ft:,} min={fmin:.6f} max={fmax:.6f} "
+                        f"mean={fmean:.6f} std={fstd:.6f}"
+                    )
+    
+                out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
+
+                if debug_hr and step_i == 0 and os.environ.get("TRELLIS2_HR_DETERMINISM", "0") == "1":
+                    _hr_determinism(
+                        lambda: self.sample_once(model, sample, t, t_prev, cond, **kwargs),
+                        out, {"cond": cond, **kwargs},
+                    )
+
+                if debug_hr:
+                    xi, xt, xmin, xmax, xmean, xstd = _diag_feats(out.pred_x_0)
+                    pi, pt, pmin, pmax, pmean, pstd = _diag_feats(out.pred_x_prev)
+    
+                    print(
+                        f"  [HR step {step_i:2d} X0]    "
+                        f"finite={xi:,}/{xt:,} min={xmin:.6f} max={xmax:.6f} "
+                        f"mean={xmean:.6f} std={xstd:.6f}"
+                    )
+                    print(
+                        f"  [HR step {step_i:2d} PREV]  "
+                        f"finite={pi:,}/{pt:,} min={pmin:.6f} max={pmax:.6f} "
+                        f"mean={pmean:.6f} std={pstd:.6f}"
+                    )
+    
+                    if xi != xt or pi != pt:
+                        if os.environ.get("TRELLIS2_HR_NAN_PROBE", "0") == "1":
+                            _hr_nan_probe(
+                                lambda: self.sample_once(model, sample, t, t_prev, cond, **kwargs),
+                                model,
+                            )
+                        raise RuntimeError(
+                            f"[HR sampler] first NaN/Inf at step {step_i}: "
+                            f"pred_x0={xi:,}/{xt:,}, pred_x_prev={pi:,}/{pt:,}"
+                        )
+    
+                sample = out.pred_x_prev
+                ret.pred_x_t.append(out.pred_x_prev)
+                ret.pred_x_0.append(out.pred_x_0)
+    
+                if tqdm_desc == "Sampling sparse structure" and step_i % 4 == 0:
+                    x0 = out.pred_x_0
+                    print(f"  [SS step {step_i:2d}] t={t:.3f} pred_x0: mean={x0.mean():.4f}, std={x0.std():.4f}, max={x0.max():.4f}, min={x0.min():.4f}")
+            ret.samples = sample
+        finally:
+            if _previous_sparse_attn is not None:
+                sparse_config.ATTN = _previous_sparse_attn
+                print(
+                    "[HR sampler ROCm] restored sparse attention backend: "
+                    f"{_previous_sparse_attn}"
+                )
+            if _previous_hr_dtype is not None:
+                model.dtype = _previous_hr_dtype
+                print(
+                    "[HR sampler ROCm] restored model dtype: "
+                    f"{_previous_hr_dtype}"
+                )
         return ret
 
 
@@ -399,15 +595,35 @@ class FlowEulerMultiViewSampler(FlowEulerSampler):
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
         
-        for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
+        # TRELLIS2_PROFILE_STEP=<i>: torch.profiler around step i (use >=1: step 0 includes the
+        # flash-attn autotune); writes the op tables to TRELLIS2_PROFILE_OUT, then aborts the job
+        prof_step = int(os.environ.get("TRELLIS2_PROFILE_STEP", "-1"))
+        for step_i, (t, t_prev) in enumerate(tqdm(t_pairs, desc=tqdm_desc, disable=not verbose)):
+            prof = None
+            if step_i == prof_step:
+                prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                          torch.profiler.ProfilerActivity.CUDA],
+                                              record_shapes=True)
+                prof.__enter__()
             out = self.sample_once(
-                model, sample, t, t_prev, 
-                conds=conds, 
+                model, sample, t, t_prev,
+                conds=conds,
                 views=views,
-                front_axis=front_axis, 
-                blend_temperature=blend_temperature, 
+                front_axis=front_axis,
+                blend_temperature=blend_temperature,
                 **kwargs
             )
+            if prof is not None:
+                torch.cuda.synchronize()
+                prof.__exit__(None, None, None)
+                path = os.environ.get("TRELLIS2_PROFILE_OUT", "trellis2_profile_step.txt")
+                avg = prof.key_averages()
+                with open(path, "w") as f:
+                    for key in ("self_cuda_time_total", "cuda_time_total", "self_cpu_time_total"):
+                        f.write(f"== sorted by {key}\n{avg.table(sort_by=key, row_limit=40)}\n\n")
+                    f.write("== by input shape\n" + prof.key_averages(group_by_input_shape=True).table(
+                        sort_by="self_cuda_time_total", row_limit=30) + "\n")
+                raise RuntimeError(f"TRELLIS2_PROFILE_STEP={prof_step}: profile written to {path}, job stopped")
             sample = out.pred_x_prev
             ret.pred_x_t.append(out.pred_x_prev)
             ret.pred_x_0.append(out.pred_x_0)

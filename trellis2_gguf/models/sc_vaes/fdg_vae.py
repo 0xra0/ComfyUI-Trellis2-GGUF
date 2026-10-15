@@ -125,27 +125,128 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
                 intersected = h.replace(h.feats[..., 3:6] > 0)
                 quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
                 
-            if useTiled:
-                mesh = [Mesh(*tiled_flexible_dual_grid_to_mesh(
-                        coords=v.coords[:, 1:], 
-                        dual_vertices=v.feats, 
-                        intersected_flag=i.feats, 
-                        split_weight=q.feats, 
-                        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                        grid_size=self.resolution,
-                        tile_size=128, # Adjust this based on your GPU VRAM
-                        train=False
-                    )) for v, i, q in zip(vertices, intersected, quad_lerp)]
-            else:
-                mesh = [Mesh(*flexible_dual_grid_to_mesh(
-                        coords=v.coords[:, 1:], 
-                        dual_vertices=v.feats, 
-                        intersected_flag=i.feats, 
-                        split_weight=q.feats, 
-                        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                        grid_size=self.resolution,
-                        train=False
-                    )) for v, i, q in zip(vertices, intersected, quad_lerp)]
+            def _valid_mesh_result(result):
+                if not isinstance(result, (tuple, list)):
+                    return False
+
+                if len(result) < 2:
+                    return False
+
+                verts = result[0]
+                faces = result[1]
+
+                if verts is None or faces is None:
+                    return False
+
+                if not torch.is_tensor(verts) or not torch.is_tensor(faces):
+                    return False
+
+                if verts.numel() == 0 or faces.numel() == 0:
+                    return False
+
+                if not bool(torch.isfinite(verts).all()):
+                    return False
+
+                return True
+
+
+            mesh = []
+
+            for batch_idx, (v, i, q) in enumerate(
+                zip(vertices, intersected, quad_lerp)
+            ):
+                common_args = dict(
+                    coords=v.coords[:, 1:],
+                    dual_vertices=v.feats,
+                    intersected_flag=i.feats,
+                    split_weight=q.feats,
+                    aabb=[
+                        [-0.5, -0.5, -0.5],
+                        [ 0.5,  0.5,  0.5],
+                    ],
+                    grid_size=self.resolution,
+                    train=False,
+                )
+
+                result = None
+
+                # ------------------------------------------------------
+                # Fast path: tiled o_voxel conversion
+                # ------------------------------------------------------
+                if useTiled:
+                    try:
+                        result = tiled_flexible_dual_grid_to_mesh(
+                            **common_args,
+                            tile_size=min(
+                                128,
+                                int(self.resolution)
+                            ),
+                        )
+                    except Exception as e:
+                        print(
+                            "[Trellis2 Decoder] tiled mesher failed: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        result = None
+
+                    if not _valid_mesh_result(result):
+                        print(
+                            "[Trellis2 Decoder] tiled conversion "
+                            f"returned no mesh for batch {batch_idx}; "
+                            "retrying non-tiled conversion..."
+                        )
+
+                # ------------------------------------------------------
+                # Reliable fallback
+                # ------------------------------------------------------
+                if not _valid_mesh_result(result):
+                    try:
+                        result = flexible_dual_grid_to_mesh(
+                            **common_args
+                        )
+                    except Exception as e:
+                        raise RuntimeError(
+                            "Both tiled and non-tiled dual-grid "
+                            f"conversion failed: {e}"
+                        ) from e
+
+                # ------------------------------------------------------
+                # Model generated no extractable surface.
+                # Do not turn this into a misleading NoneType crash.
+                # ------------------------------------------------------
+                if not _valid_mesh_result(result):
+                    token_count = int(v.coords.shape[0])
+
+                    flags = i.feats
+
+                    if torch.is_tensor(flags):
+                        positive = int(
+                            flags.bool().sum().item()
+                        )
+                        total = int(flags.numel())
+                    else:
+                        positive = -1
+                        total = -1
+
+                    raise RuntimeError(
+                        "Shape decoder produced no extractable surface. "
+                        f"batch={batch_idx}, "
+                        f"resolution={self.resolution}, "
+                        f"tokens={token_count}, "
+                        f"intersections={positive}/{total}. "
+                        "The Pixal3D pipeline completed, but this "
+                        "shape sample contains no valid dual-grid mesh. "
+                        "Try shape_steps=8, another seed, or official "
+                        "Pixal3D *_mv flow weights."
+                    )
+
+                print(
+                    "[Trellis2 Decoder] mesh extracted: "
+                    f"{result[0].shape[0]:,} vertices, "
+                    f"{result[1].shape[0]:,} faces"
+                )
+
+                mesh.append(Mesh(*result))
                     
             out_list[0] = mesh
             return out_list[0] if len(out_list) == 1 else tuple(out_list)

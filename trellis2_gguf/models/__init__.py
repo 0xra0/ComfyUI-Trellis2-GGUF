@@ -148,6 +148,34 @@ def __getattr__(name):
     return globals()[name]
 
 
+def _dequant_once(model):
+    """Replace every GGML-quantized weight/bias/gamma with its fp32 dequantization (see
+    TRELLIS2_DEQUANT_ONCE in from_pretrained). Returns the number of tensors replaced."""
+    n = 0
+    for mod in model.modules():
+        for name in ("weight", "bias", "gamma"):
+            p = mod._parameters.get(name)
+            if p is None:
+                continue
+            # native ComfyUI-GGUF keeps the metadata on the GGMLTensor itself; the local
+            # GGMLLayer loader moves it to _ggml_<name>_type/_shape on the module
+            qtype = getattr(p, "tensor_type", None) or getattr(mod, f"_ggml_{name}_type", None)
+            if qtype in (None, 0, 1):
+                continue
+            t = p.data if getattr(p.data, "tensor_type", None) is not None else p
+            if getattr(t, "tensor_type", None) is None:
+                t.tensor_type = qtype
+                t.tensor_shape = getattr(mod, f"_ggml_{name}_shape")
+            w = gguf_utils.dequantize_tensor(t, torch.float32, getattr(mod, "dequant_dtype", None))
+            mod._parameters[name] = torch.nn.Parameter(w.as_subclass(torch.Tensor).contiguous(),
+                                                       requires_grad=False)
+            for meta in (f"_ggml_{name}_type", f"_ggml_{name}_shape"):
+                if hasattr(mod, meta):
+                    delattr(mod, meta)
+            n += 1
+    return n
+
+
 def from_pretrained(path: str, enable_gguf: bool = False, gguf_quant: str = "Q8_0",
                     enable_sdnq: bool = False, sdnq_use_quantized_matmul: bool = True,
                     sdnq_torch_compile: bool = False,
@@ -187,11 +215,17 @@ def from_pretrained(path: str, enable_gguf: bool = False, gguf_quant: str = "Q8_
 
     precision = kwargs.pop("precision", None)
     isPixal3D = kwargs.pop("isPixal3D", False)
-    if isPixal3D:
+    isPixal3DMV = kwargs.pop("isPixal3DMV", False)
+
+    _model_path_norm = os.path.normpath(str(path))
+
+    if isPixal3DMV or "Pixal3D-GGUF-MV" in _model_path_norm:
+        model_manager.CURRENT_MODELNAME = "Pixal3D-GGUF-MV"
+    elif isPixal3D:
         model_manager.CURRENT_MODELNAME = "Pixal3D-GGUF"
     else:
         model_manager.CURRENT_MODELNAME = "Trellis2"
-        
+
     basename = os.path.basename(path)
 
     logger.debug("Loading %s  sdnq=%s  gguf=%s", basename, enable_sdnq, enable_gguf)
@@ -337,6 +371,12 @@ def from_pretrained(path: str, enable_gguf: bool = False, gguf_quant: str = "Q8_
 
     try:
         merged_args = {**config['args'], **kwargs}
+        # TRELLIS2_COMPUTE_DTYPE=fp32: RDNA2 (gfx1030) has no bf16 math units; bf16 matmul
+        # runs ~4.7x slower than fp32 there, and fp32 is strictly more precise.
+        _cd = os.environ.get("TRELLIS2_COMPUTE_DTYPE")
+        if _cd and merged_args.get("dtype") in ("bf16", "bfloat16", "fp16", "float16"):
+            logger.info("%s: compute dtype %s -> %s", config['name'], merged_args["dtype"], _cd)
+            merged_args["dtype"] = _cd
         sig = inspect.signature(model_class.__init__)
         has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
         final_args = {k: v for k, v in merged_args.items() if has_var_kwargs or k in sig.parameters}
@@ -350,7 +390,11 @@ def from_pretrained(path: str, enable_gguf: bool = False, gguf_quant: str = "Q8_
     if is_gguf:
         model = gguf_utils.convert_to_ggml(model)
 
-    model.load_state_dict(sd, strict=False)
+    _load_res = model.load_state_dict(sd, strict=False)
+    if os.environ.get("TRELLIS2_LEAK_PROBE", "0") == "1":
+        print(f"[LeakProbe load {config['name']}] missing={len(_load_res.missing_keys)} "
+              f"{_load_res.missing_keys[:20]} unexpected={len(_load_res.unexpected_keys)} "
+              f"{_load_res.unexpected_keys[:10]}", flush=True)
 
     if is_gguf and hasattr(model, "rope_phases") and model.rope_phases is not None:
         try:
@@ -363,6 +407,14 @@ def from_pretrained(path: str, enable_gguf: bool = False, gguf_quant: str = "Q8_
             model.rope_phases.copy_(rope_phases)
         except Exception as e:
             logger.warning("Failed to regenerate rope_phases: %s", e)
+
+    # TRELLIS2_DEQUANT_ONCE=1 (with TRELLIS2_COMPUTE_DTYPE=fp32): dequantize every GGML weight
+    # once, here, instead of on every forward pass. Same dequantize_tensor call and target
+    # dtype as the forward path, so the weights are bit-identical; costs VRAM (1.3B params in
+    # fp32 = ~5.3 GB) and saves the per-step dequant work.
+    if is_gguf and os.environ.get("TRELLIS2_DEQUANT_ONCE") == "1" and _cd in ("fp32", "float32"):
+        n = _dequant_once(model)
+        logger.info("%s: dequantized %d GGML tensors once to float32", config['name'], n)
 
     if not is_gguf:
         # Reload directly to CUDA for FP16 models (avoids CPU overhead)

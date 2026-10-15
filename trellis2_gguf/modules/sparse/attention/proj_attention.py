@@ -19,6 +19,25 @@ def _is_sparse(x) -> bool:
 
 
 
+def _align_by_coords(x_coords, proj_coords, proj_feats):
+    """Gather proj_feats rows whose (z, y, x) coords match each row of x_coords; rows
+    without a match get zeros.
+
+    A sort + binary-search join: O(N log N) memory and time in the number of voxels.
+    The previous dense lookup table had (max_coord + 1)**3 rows, i.e. 15.6 GiB for a
+    long object reaching far into a 1024-res grid even with ~1k occupied voxels.
+    """
+    m = int(torch.maximum(x_coords.max(), proj_coords.max()).item()) + 1
+    key = lambda c: (c[:, 0] * m + c[:, 1]) * m + c[:, 2]
+    proj_key, order = torch.sort(key(proj_coords))
+    x_key = key(x_coords)
+    pos = torch.searchsorted(proj_key, x_key).clamp_(max=proj_key.numel() - 1)
+    hit = proj_key[pos] == x_key
+    out = proj_feats[order[pos]]
+    out[~hit] = 0
+    return out
+
+
 class SparseProjectAttention(nn.Module):
     """
     Sparse Projection-based Attention Module with per-block proj_linear.
@@ -48,12 +67,7 @@ class SparseProjectAttention(nn.Module):
             x_coords_key = x.coords[:, 1:].long().to(device)
             proj_coords_key = proj_context.coords[:, 1:].long().to(device)
             proj_feats_dev = proj_context.feats.to(device)
-            proj_max = int(proj_coords_key.max().item()) + 1
-            proj_flat = proj_coords_key[:, 0] * proj_max * proj_max + proj_coords_key[:, 1] * proj_max + proj_coords_key[:, 2]
-            x_flat = x_coords_key[:, 0] * proj_max * proj_max + x_coords_key[:, 1] * proj_max + x_coords_key[:, 2]
-            proj_lookup = torch.zeros(int(proj_max**3), proj_feats_dev.shape[1], device=device, dtype=proj_feats_dev.dtype)
-            proj_lookup[proj_flat] = proj_feats_dev
-            aligned_feats = proj_lookup[x_flat]
+            aligned_feats = _align_by_coords(x_coords_key, proj_coords_key, proj_feats_dev)
             proj_feats = self.proj_linear(aligned_feats)
             combined_feats = proj_feats + global_out.feats
         else:

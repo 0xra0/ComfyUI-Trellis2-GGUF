@@ -73,8 +73,39 @@ class SparseChannel2Spatial(nn.Module):
                 raise ValueError('Cache not found. Provide subdivision tensor or pair SparseChannel2Spatial with SparseSpatial2Channel.')
             else:
                 sub = subdivision.feats         # [N, self.factor ** DIM]
-                N_leaf = sub.sum(dim=-1)        # [N]
-                subidx = sub.nonzero()[:, -1]
+
+                # PyTorch ROCm/gfx1030 can hard-abort in CUDA/HIP nonzero()
+                # for this decoder subdivision mask.  This tensor is small
+                # compared with the sparse-conv workload, so on ROCm perform
+                # only the index extraction on CPU and immediately return the
+                # resulting indices/repeat counts to the GPU.
+                _is_rocm = (
+                    sub.is_cuda
+                    and getattr(torch.version, "hip", None) is not None
+                )
+
+                if _is_rocm:
+                    sub_cpu = sub.detach().to("cpu")
+
+                    N_leaf = (
+                        sub_cpu.sum(dim=-1, dtype=torch.int64)
+                        .to(device=x.device)
+                    )
+
+                    nz_cpu = torch.nonzero(
+                        sub_cpu,
+                        as_tuple=False,
+                    )
+
+                    subidx = (
+                        nz_cpu[:, -1]
+                        .to(device=x.device, dtype=torch.long)
+                    )
+
+                    del sub_cpu, nz_cpu
+                else:
+                    N_leaf = sub.sum(dim=-1)
+                    subidx = sub.nonzero()[:, -1]
                 new_coords = x.coords.clone().detach()
                 new_coords[:, 1:] *= self.factor
                 new_coords = torch.repeat_interleave(new_coords, N_leaf, dim=0, output_size=subidx.shape[0])

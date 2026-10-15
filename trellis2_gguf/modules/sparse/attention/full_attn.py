@@ -1,4 +1,5 @@
 from typing import *
+import os
 import torch
 from .. import VarLenTensor
 from .. import config
@@ -178,28 +179,63 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
     def _sdpa_varlen(q, k, v, q_seqlen, kv_seqlen):
         # q: [TQ, H, Cq], k: [TK, H, Cq], v: [TK, H, Cv]
         # returns: [TQ, H, Cv]
+        # Queries are processed in blocks: where no flash/mem-efficient SDPA kernel
+        # exists (e.g. RDNA2/gfx1030, which AOTriton does not cover), torch falls back
+        # to the math backend and materializes the whole [1,H,qn,kn] score matrix, so
+        # peak memory would otherwise grow with qn*kn. Attention here is always full
+        # and non-causal, making per-block queries exactly equivalent to one big call.
+        attn_block_bytes = 256 * 1024 * 1024
         outs = []
         q_off = 0
         kv_off = 0
         for n in range(len(q_seqlen)):
             qn = q_seqlen[n]
             kn = kv_seqlen[n]
-            q_i = q[q_off:q_off + qn].transpose(0, 1)   # [H, qn, C]
-            k_i = k[kv_off:kv_off + kn].transpose(0, 1) # [H, kn, C]
-            v_i = v[kv_off:kv_off + kn].transpose(0, 1) # [H, kn, Cv]
+            H = q.shape[1]
 
-            # SDPA expects [B, heads, L, C] or [heads, L, C]. We use [1, H, L, C]
-            q_i = q_i.unsqueeze(0)  # [1, H, qn, C]
-            k_i = k_i.unsqueeze(0)  # [1, H, kn, C]
-            v_i = v_i.unsqueeze(0)  # [1, H, kn, Cv]
+            k_i = k[kv_off:kv_off + kn].transpose(0, 1).unsqueeze(0)  # [1, H, kn, C]
+            v_i = v[kv_off:kv_off + kn].transpose(0, 1).unsqueeze(0)  # [1, H, kn, Cv]
 
-            out_i = torch.nn.functional.scaled_dot_product_attention(
-                q_i, k_i, v_i,
-                dropout_p=0.0,
-                is_causal=False
-            )[0]  # [H, qn, Cv]
+            # 4 bytes/elem: the math backend upcasts the softmax to fp32.
+            block = attn_block_bytes // max(1, H * kn * 4)
+            block = max(256, min(qn, block))
 
-            outs.append(out_i.transpose(0, 1))  # [qn, H, Cv]
+            chunks = []
+            for s in range(0, qn, block):
+                e = min(s + block, qn)
+                q_i = q[q_off + s:q_off + e].transpose(0, 1).unsqueeze(0)  # [1, H, e-s, C]
+                _force_math = (
+                    getattr(torch.version, "hip", None) is not None
+                    and q_i.dtype == torch.float32
+                    and os.environ.get(
+                        "TRELLIS2_ROCM_HR_SDPA_MATH",
+                        "1",
+                    ) == "1"
+                )
+                if _force_math:
+                    try:
+                        from torch.nn.attention import sdpa_kernel, SDPBackend
+                        with sdpa_kernel(backends=[SDPBackend.MATH]):
+                            out_i = torch.nn.functional.scaled_dot_product_attention(
+                                q_i, k_i, v_i,
+                                dropout_p=0.0,
+                                is_causal=False,
+                            )[0]
+                    except Exception:
+                        out_i = torch.nn.functional.scaled_dot_product_attention(
+                            q_i, k_i, v_i,
+                            dropout_p=0.0,
+                            is_causal=False,
+                        )[0]
+                else:
+                    out_i = torch.nn.functional.scaled_dot_product_attention(
+                        q_i, k_i, v_i,
+                        dropout_p=0.0,
+                        is_causal=False,
+                    )[0]  # [H, e-s, Cv]
+                chunks.append(out_i.transpose(0, 1))  # [e-s, H, Cv]
+
+            outs.append(torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0])
             q_off += qn
             kv_off += kn
 
@@ -230,15 +266,19 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
                 import flash_attn
             cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)
             cu_seqlens_kv = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]).int().to(device)
-            if num_all_args == 1:
-                # needs packed qkv [T, 3, H, C]
-                out = flash_attn.flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens_q, max(q_seqlen))
-            elif num_all_args == 2:
-                out = flash_attn.flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
-            elif num_all_args == 3:
-                out = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
-        except Exception:
-            # fallback to torch SDPA
+            # Triton flash-attn (ROCm) is fast only in fp16; bf16 is emulated on RDNA2 and fp32
+            # unsupported. fp16 carries more mantissa than bf16, and flash accumulates in fp32.
+            # Out-of-range inputs would overflow fp16, so they take the SDPA path instead.
+            out_dtype = q.dtype
+            q16, k16, v16 = (t.to(torch.float16) for t in (q, k, v))
+            if not all(torch.isfinite(t).all() for t in (q16, k16, v16)):
+                raise OverflowError("attention inputs exceed fp16 range")
+            out = flash_attn.flash_attn_varlen_func(q16, k16, v16, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen)).to(out_dtype)
+        except Exception as e:
+            # fallback to torch SDPA; say why once, or a missing package goes unnoticed
+            if not globals().get('_flash_fallback_logged'):
+                globals()['_flash_fallback_logged'] = True
+                print(f"[SPARSE] flash_attn unavailable, using SDPA: {type(e).__name__}: {e}")
             out = _sdpa_varlen(q, k, v, q_seqlen, kv_seqlen)
 
     elif config.ATTN == 'flash_attn_3':

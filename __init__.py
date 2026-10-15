@@ -35,7 +35,7 @@ try:
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            image = torch.stack(image).to(next(self.model.parameters()).device)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
@@ -143,12 +143,26 @@ try:
         else:
             is_texture_stage = target_size == 1024
 
-        if self.low_vram and not is_texture_stage:
+        mv_naf_tiling_disabled = (
+            getattr(torch.version, "hip", None)
+            is not None
+            and os.environ.get(
+                "TRELLIS2_MV_NAF_TILING",
+                "0",
+            ) == "0"
+        )
+
+        if (
+            self.low_vram
+            and not is_texture_stage
+            and not mv_naf_tiling_disabled
+        ):
             image_cond_model.to(device)
             image_cond_model.naf_tile_factor = 4
         else:
             if self.low_vram:
                 image_cond_model.to(device)
+
             image_cond_model.naf_tile_factor = 1
         
         orig_grid_res = image_cond_model.grid_resolution

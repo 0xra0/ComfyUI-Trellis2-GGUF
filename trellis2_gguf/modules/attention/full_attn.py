@@ -9,6 +9,31 @@ __all__ = [
 ]
 
 
+def _sdpa_chunked(q, k, v, block_bytes=256 * 1024 * 1024):
+    """
+    scaled_dot_product_attention over q/k/v of shape [N, H, L, C], blocking the
+    query dimension.
+
+    Where no flash/mem-efficient SDPA kernel exists (e.g. RDNA2/gfx1030, which
+    AOTriton does not cover), torch falls back to the math backend and
+    materializes the whole [N, H, Lq, Lk] score matrix, so peak memory would
+    otherwise grow with Lq*Lk. Attention here is full and non-causal, making
+    per-block queries exactly equivalent to one big call.
+    """
+    N, H, Lq, _ = q.shape
+    Lk = k.shape[2]
+    # 4 bytes/elem: the math backend upcasts the softmax to fp32.
+    block = block_bytes // max(1, N * H * Lk * 4)
+    block = max(256, min(Lq, block))
+    if block >= Lq:
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    chunks = [
+        torch.nn.functional.scaled_dot_product_attention(q[:, :, s:s + block], k, v)
+        for s in range(0, Lq, block)
+    ]
+    return torch.cat(chunks, dim=2)
+
+
 def _naive_sdpa(q, k, v):
     """
     Naive implementation of scaled dot product attention.
@@ -122,8 +147,6 @@ def scaled_dot_product_attention(*args, **kwargs):
             elif num_all_args == 3:
                 out = flash_attn_3.flash_attn_func(q, k, v)
     elif config.BACKEND == 'sdpa':
-        if 'sdpa' not in globals():
-            from torch.nn.functional import scaled_dot_product_attention as sdpa
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=2)
         elif num_all_args == 2:
@@ -131,7 +154,7 @@ def scaled_dot_product_attention(*args, **kwargs):
         q = q.permute(0, 2, 1, 3)   # [N, H, L, C]
         k = k.permute(0, 2, 1, 3)   # [N, H, L, C]
         v = v.permute(0, 2, 1, 3)   # [N, H, L, C]
-        out = sdpa(q, k, v)         # [N, H, L, C]
+        out = _sdpa_chunked(q, k, v)    # [N, H, L, C]
         out = out.permute(0, 2, 1, 3)   # [N, L, H, C]
     elif config.BACKEND == 'naive':
         if num_all_args == 1:

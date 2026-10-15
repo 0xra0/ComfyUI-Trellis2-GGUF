@@ -22,6 +22,8 @@ import folder_paths
 GGUF_REPO   = "Aero-Ex/Trellis2-GGUF"
 DINOV3_REPO = "Aero-Ex/Dinov3"
 SDNQ_REPO   = "Aero-Ex/Trellis2-SDNQ"
+PIXAL3D_GGUF_REPO = "Aero-Ex/Pixal3D-GGUF"
+PIXAL3D_MV_SOURCE_REPO = "TencentARC/Pixal3D"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Aero-Ex/Trellis2-GGUF subfolder map  (basename prefix → HF subfolder)
@@ -49,11 +51,20 @@ ENC_DEC_PREFIXES = ("ss_dec_", "shape_dec_", "tex_dec_", "shape_enc_", "tex_enc_
 
 CURRENT_MODELNAME = "Trellis2"
 
+def is_pixal3d_modelset() -> bool:
+    return CURRENT_MODELNAME in ("Pixal3D-GGUF", "Pixal3D-GGUF-MV")
+
+def is_pixal3d_mv_modelset() -> bool:
+    return CURRENT_MODELNAME == "Pixal3D-GGUF-MV"
+
 def get_models_dir() -> str:
     """Absolute path to models directory."""
-    dir_name = "Trellis2"
-    if CURRENT_MODELNAME == "Pixal3D-GGUF":
+    if CURRENT_MODELNAME == "Pixal3D-GGUF-MV":
+        dir_name = "Pixal3D-GGUF-MV"
+    elif CURRENT_MODELNAME == "Pixal3D-GGUF":
         dir_name = "Pixal3D-GGUF"
+    else:
+        dir_name = "Trellis2"
     return os.path.join(folder_paths.models_dir, dir_name)
 
 
@@ -76,7 +87,7 @@ def remote_path(basename: str, suffix: str) -> str:
         if suffix == "_BF16.gguf":
             suffix = ".gguf"  # BF16 ggufs don't have the _BF16 suffix appended
 
-    path_map = PIXAL3D_REPO_PATH_MAP if CURRENT_MODELNAME == "Pixal3D-GGUF" else REPO_PATH_MAP
+    path_map = PIXAL3D_REPO_PATH_MAP if CURRENT_MODELNAME in ("Pixal3D-GGUF", "Pixal3D-GGUF-MV") else REPO_PATH_MAP
 
     for prefix, folder in path_map.items():
         if basename.startswith(prefix):
@@ -335,7 +346,7 @@ def ensure_model_files(
             # Need to download
             hf_filename = remote_path(basename, sfx)
             download_repo = gguf_repo
-            if CURRENT_MODELNAME == "Pixal3D-GGUF" and basename.startswith(("shape_enc_", "tex_enc_")):
+            if CURRENT_MODELNAME in ("Pixal3D-GGUF", "Pixal3D-GGUF-MV") and basename.startswith(("shape_enc_", "tex_enc_")):
                 download_repo = GGUF_REPO
 
             print(f"[ModelManager] Downloading {hf_filename} from {download_repo}...")

@@ -46,6 +46,7 @@ import meshlib.mrmeshpy as mrmeshpy
 
 import nvdiffrast.torch as dr
 from flex_gemm.ops.grid_sample import grid_sample_3d
+from .rocm_safe_bake import use_safe_vertex_bake, sparse_trilinear_cpu, vertex_normals_cpu
 
 import comfy.model_management as mm
 from comfy.utils import load_torch_file, ProgressBar, common_upscale
@@ -54,6 +55,7 @@ import comfy.utils
 from .trellis2_gguf.pipelines import Trellis2ImageTo3DPipeline
 from .trellis2_gguf.representations import Mesh, MeshWithVoxel
 from .trellis2_gguf.modules.sparse import SparseTensor
+from .trellis2_gguf.utils.uv_rasterizer import rasterize_uv, interpolate_uv
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 comfy_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -158,6 +160,10 @@ def seed_all(seed: int = 0):
 class ImageUtils:
     @staticmethod
     def pil_to_tensor(image):
+        if image.mode not in ("RGB", "RGBA"):
+            # P/L/I frames give a 2-D array, which breaks the (H,W,C) assumption downstream
+            has_alpha = "A" in image.getbands() or (image.mode == "P" and "transparency" in image.info)
+            image = image.convert("RGBA" if has_alpha else "RGB")
         return torch.from_numpy(np.array(image).astype(np.float32) / 255.0)[None,]
 
     @staticmethod
@@ -363,7 +369,7 @@ class Trellis2_GGUFLoadModel:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "modelname": (["TRELLIS.2-4B", "Pixal3D-GGUF"],),
+                "modelname": (["TRELLIS.2-4B", "Pixal3D-GGUF", "Pixal3D-GGUF-MV"],),
                 "model_format": ([
                     "GGUF BF16",
                     "GGUF Q8_0", 
@@ -408,21 +414,88 @@ class Trellis2_GGUFLoadModel:
 
         model_manager.CURRENT_MODELNAME = modelname
         model_path = model_manager.get_models_dir()
+
+        isPixal3DMV = modelname == "Pixal3D-GGUF-MV"
+        isPixal3D = modelname in ("Pixal3D-GGUF", "Pixal3D-GGUF-MV")
+
+        pipeline_config_name = (
+            "pipeline_mv.json"
+            if isPixal3DMV
+            else "pipeline.json"
+        )
+
+        print(
+            f"[Trellis2-GGUF] model={modelname} "
+            f"path={model_path} "
+            f"config={pipeline_config_name}"
+        )
         
         repo_id = model_manager.GGUF_REPO
-        if modelname == "Pixal3D-GGUF":
+        if modelname in ("Pixal3D-GGUF", "Pixal3D-GGUF-MV"):
             repo_id = "Aero-Ex/Pixal3D-GGUF"
 
         # Ensure pipeline.json exists first; read it, then delegate everything
         import json
-        pipeline_json_local = os.path.join(model_path, "pipeline.json")
+        pipeline_json_local = os.path.join(model_path, pipeline_config_name)
         if not os.path.exists(pipeline_json_local):
+            if isPixal3DMV:
+                raise FileNotFoundError(
+                    "[Pixal3D-GGUF-MV] Missing official pipeline_mv.json: "
+                    + pipeline_json_local
+                )
+
             from huggingface_hub import hf_hub_download
-            print(f"[Trellis2-GGUF] Downloading pipeline.json from {repo_id}...")
-            hf_hub_download(repo_id=repo_id, filename="pipeline.json", local_dir=model_path)
+            print(
+                f"[Trellis2-GGUF] Downloading "
+                f"{pipeline_config_name} from {repo_id}..."
+            )
+            hf_hub_download(
+                repo_id=repo_id,
+                filename=pipeline_config_name,
+                local_dir=model_path,
+            )
 
         with open(pipeline_json_local, 'r') as f:
             pipeline_config = json.load(f)
+
+        if isPixal3DMV:
+            _mv_models = pipeline_config.get("args", {}).get("models", {})
+
+            _required_mv = {
+                "sparse_structure_flow_model":
+                    "ss_flow_img_dit_1_3B_64_bf16_mv",
+
+                "shape_slat_flow_model_512":
+                    "slat_flow_img2shape_dit_1_3B_512_bf16_mv",
+
+                "shape_slat_flow_model_1024":
+                    "slat_flow_img2shape_dit_1_3B_1024_bf16_mv",
+
+                "tex_slat_flow_model_1024":
+                    "slat_flow_imgshape2tex_dit_1_3B_1024_bf16_mv",
+            }
+
+            for _key, _expected in _required_mv.items():
+                _value = _mv_models.get(_key)
+
+                if not _value:
+                    raise RuntimeError(
+                        f"[Pixal3D-GGUF-MV] "
+                        f"{pipeline_config_name} is missing {_key}"
+                    )
+
+                _base = os.path.basename(_value)
+
+                if _base != _expected:
+                    raise RuntimeError(
+                        "[Pixal3D-GGUF-MV] WRONG PIPELINE CONFIG: "
+                        f"{_key} -> {_base}; expected {_expected}"
+                    )
+
+            print(
+                "[Pixal3D-GGUF-MV] Verified official *_mv "
+                "flow checkpoint names."
+            )
 
         # This is the ONLY place that downloads model files
         model_manager.ensure_model_files(model_format, pipeline_config, gguf_repo=repo_id)
@@ -447,13 +520,9 @@ class Trellis2_GGUFLoadModel:
             _torch.backends.cuda.matmul.allow_tf32 = True
             _torch.backends.cudnn.allow_tf32 = True
             _torch.set_float32_matmul_precision('high')
-
-        isPixal3D = False
-        if modelname == "Pixal3D-GGUF":
-            isPixal3D = True
-
         pipeline = Trellis2ImageTo3DPipeline.from_pretrained(
             model_path,
+            config_file=pipeline_config_name,
             keep_models_loaded=keep_models_loaded,
             enable_gguf=enable_gguf,
             gguf_quant=gguf_quant,
@@ -463,6 +532,7 @@ class Trellis2_GGUFLoadModel:
             sdnq_torch_compile=sdnq_torch_compile,
             sdnq_svd_rank=sdnq_svd_rank,
             isPixal3D=isPixal3D,
+            isPixal3DMV=isPixal3DMV,
         )
 
         pipeline.low_vram = low_vram
@@ -478,12 +548,84 @@ class Trellis2_GGUFLoadModel:
         return (pipeline,)
 
 
+
+class Trellis2_Pixal3DMVGGUFLoadModel(Trellis2_GGUFLoadModel):
+    """
+    Dedicated official Pixal3D MultiView GGUF loader.
+
+    No modelname widget is exposed, so an old ComfyUI workflow cannot
+    silently retain 'Pixal3D-GGUF' and fall back to single-view weights.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_format": ([
+                    "GGUF BF16",
+                    "GGUF Q8_0",
+                    "GGUF Q6_K",
+                    "GGUF Q5_K_M",
+                    "GGUF Q4_K_M",
+                ], {"default": "GGUF Q8_0"}),
+
+                "backend": (
+                    ["flash_attn", "xformers", "sdpa", "flash_attn_3"],
+                    {"default": "sdpa"},
+                ),
+
+                "device": (
+                    ["cpu", "cuda"],
+                    {"default": "cuda"},
+                ),
+
+                "low_vram": (
+                    "BOOLEAN",
+                    {"default": True},
+                ),
+
+                "keep_models_loaded": (
+                    "BOOLEAN",
+                    {"default": False},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("TRELLIS2PIPELINE",)
+    RETURN_NAMES = ("pipeline",)
+    FUNCTION = "process"
+    CATEGORY = "Trellis2Wrapper (GGUF)"
+    OUTPUT_NODE = True
+
+    def process(
+        self,
+        model_format,
+        backend,
+        device,
+        low_vram,
+        keep_models_loaded,
+    ):
+        print(
+            "[Pixal3D-GGUF-MV Loader] "
+            "FORCING official MultiView model set"
+        )
+
+        return super().process(
+            "Pixal3D-GGUF-MV",
+            model_format,
+            backend,
+            device,
+            low_vram,
+            keep_models_loaded,
+        )
+
+
 class Trellis2_SDNQLoadModel(Trellis2_GGUFLoadModel):
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "modelname": (["TRELLIS.2-4B", "Pixal3D-GGUF"],),
+                "modelname": (["TRELLIS.2-4B", "Pixal3D-GGUF", "Pixal3D-GGUF-MV"],),
                 "model_format": ([
                     "sdnq_int8_svd32",
                     "sdnq_int8_svd64",
@@ -820,7 +962,7 @@ class Trellis2_GGUFMeshWithVoxelToTrimesh:
         return {
             "required": {
                 "mesh": ("MESHWITHVOXEL",),
-                "reorient_vertices":(["None","90 degrees","-90 degrees"],{"default":"90 degrees"}),
+                "reorient_vertices": (["None","90 degrees","-90 degrees","Pixal3D official"],{"default":"Pixal3D official"}),
                 "rotate_x": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 1.0}),
                 "rotate_y": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 1.0}),
                 "rotate_z": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 1.0}),
@@ -838,11 +980,43 @@ class Trellis2_GGUFMeshWithVoxelToTrimesh:
         
         vertices_np = mesh_copy.vertices.cpu().numpy()
         
+        # Force the correct Pixal3D output coordinate system
+        # even for old saved workflows whose widget still contains
+        # "90 degrees".
+        if os.environ.get(
+            "TRELLIS2_PIXAL3D_FORCE_OFFICIAL_ORIENTATION",
+            "0",
+        ) == "1":
+            reorient_vertices = "Pixal3D official"
+
+        _src = vertices_np.copy()
+
         if reorient_vertices == '90 degrees':
-            vertices_np[:, 1], vertices_np[:, 2] = vertices_np[:, 2], -vertices_np[:, 1]
+            vertices_np[:, 0] = _src[:, 0]
+            vertices_np[:, 1] = _src[:, 2]
+            vertices_np[:, 2] = -_src[:, 1]
+
         elif reorient_vertices == '-90 degrees':
-            vertices_np[:, 1], vertices_np[:, 2] = -vertices_np[:, 2], vertices_np[:, 1]
-        
+            vertices_np[:, 0] = _src[:, 0]
+            vertices_np[:, 1] = -_src[:, 2]
+            vertices_np[:, 2] = _src[:, 1]
+
+        elif reorient_vertices == 'Pixal3D official':
+            # TencentARC Pixal3D export frame:
+            #
+            # [-1,  0,  0]
+            # [ 0,  0, -1]
+            # [ 0, -1,  0]
+            #
+            vertices_np[:, 0] = -_src[:, 0]
+            vertices_np[:, 1] = -_src[:, 2]
+            vertices_np[:, 2] = -_src[:, 1]
+
+            print(
+                "[Pixal3D export] "
+                "official orientation applied"
+            )
+
         if rotate_x != 0.0 or rotate_y != 0.0 or rotate_z != 0.0:
             rx, ry, rz = np.deg2rad(rotate_x), np.deg2rad(rotate_y), np.deg2rad(rotate_z)
             cx, sx = np.cos(rx), np.sin(rx)
@@ -882,6 +1056,23 @@ class Trellis2_GGUFExportMesh:
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, folder_paths.get_output_directory())                      
         output_glb_path = Path(full_output_folder, f'{filename}_{counter:05}_.{file_format}')
         output_glb_path.parent.mkdir(exist_ok=True)
+        # --- Consistent export size / placement (opt-out: env TRELLIS2_NORMALIZE_SIZE=0) ---
+        try:
+            _norm_target = float(os.environ.get("TRELLIS2_NORMALIZE_SIZE", "1.0"))
+        except Exception:
+            _norm_target = 1.0
+        if _norm_target > 0.0 and getattr(trimesh, "vertices", None) is not None and len(trimesh.vertices) > 0:
+            try:
+                _v = np.array(trimesh.vertices, dtype=np.float64)
+                _vmin = _v.min(axis=0); _vmax = _v.max(axis=0)
+                _cur = float((_vmax - _vmin).max())
+                if _cur > 1e-9:
+                    _v = (_v - (_vmin + _vmax) * 0.5) * (_norm_target / _cur)  # center XY + uniform scale
+                    _v[:, 2] = _v[:, 2] - _v[:, 2].min()                  # sit on ground (Z=0)
+                    trimesh.vertices = _v.astype(np.float32)
+                    print(f"[Trellis2] Normalized export bbox -> {_norm_target} (was {_cur:.4f})")
+            except Exception as _e:
+                print("[Trellis2] normalize skipped:", _e)
 
         if file_format=='obj':
             materialName = f"{filename}_{counter:05}_.mtl"
@@ -1117,12 +1308,15 @@ class Trellis2_GGUFUnWrapAndRasterizer:
             out_vertices, out_faces = cumesh.read()
             out_vertices = out_vertices.cuda()
             out_faces = out_faces.cuda()
-            cumesh.compute_vertex_normals()
-            out_normals = cumesh.read_vertex_normals()
-            
-            # Sample attributes directly at vertex positions from the voxel grid
-            # No BVH mapping needed - the voxel grid contains all the color information
-            vertex_attrs = grid_sample_3d(
+            if use_safe_vertex_bake():
+                print('[Trellis2] ROCm safe vertex bake (CPU sampling)')
+                out_normals = vertex_normals_cpu(out_vertices, out_faces)
+                vertex_attrs = sparse_trilinear_cpu(attr_volume, coords, grid_size.tolist(),
+                                                    (out_vertices - aabb[0]) / voxel_size)
+            else:
+              cumesh.compute_vertex_normals()
+              out_normals = cumesh.read_vertex_normals()
+              vertex_attrs = grid_sample_3d(
                 attr_volume,
                 torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
                 shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
@@ -1251,50 +1445,44 @@ class Trellis2_GGUFUnWrapAndRasterizer:
         cumesh.compute_vertex_normals()
         out_normals = cumesh.read_vertex_normals()[out_vmaps]        
 
-        # nvdiffrast requires int32 for tri/faces
         out_faces_int32 = out_faces.to(torch.int32)
 
         print("Sampling attributes...")
-        # Setup differentiable rasterizer context
-        ctx = dr.RasterizeCudaContext()
-        # Prepare UV coordinates for rasterization (rendering in UV space)
-        uvs_rast = torch.cat([out_uvs * 2 - 1, torch.zeros_like(out_uvs[:, :1]), torch.ones_like(out_uvs[:, :1])], dim=-1).unsqueeze(0)
-        rast = torch.zeros((1, texture_size, texture_size, 4), device='cuda', dtype=torch.float32)
-        
-        # Rasterize in chunks to save memory
-        for i in range(0, out_faces_int32.shape[0], 100000):
-            rast_chunk, _ = dr.rasterize(
-                ctx, uvs_rast, out_faces_int32[i:i+100000],
-                resolution=[texture_size, texture_size],
-            )
-            mask_chunk = rast_chunk[..., 3:4] > 0
-            rast_chunk[..., 3:4] += i # Store face ID in alpha channel
-            rast = torch.where(mask_chunk, rast_chunk, rast)
-        
+        # Rasterize the UV atlas. nvdiffrast's rasterizer is CUDA-only and every
+        # HIP port of it currently mis-rasterizes, so this is done in torch.
+        rast_face_id, rast_bary = rasterize_uv(out_uvs, out_faces_int32, texture_size)
+
         # Mask of valid pixels in texture
-        mask = rast[0, ..., 3] > 0
-        
+        mask = rast_face_id > 0
+
         # Interpolate 3D positions in UV space (finding 3D coord for every texel)
-        pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces_int32)[0][0]
+        pos = interpolate_uv(out_vertices, rast_face_id, rast_bary, out_faces_int32)
         valid_pos = pos[mask]
-        
+
         # Map these positions back to the *original* high-res mesh to get accurate attributes
         # This corrects geometric errors introduced by simplification/remeshing
         _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
         orig_tri_verts = bvh.vertices[bvh.faces[face_id.long()]] # (N_new, 3, 3)
-        valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)        
-        
+        valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+
         torch.cuda.synchronize()
-        
+
         # Trilinear sampling from the attribute volume (Color, Material props)
         attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device='cuda')
+        if valid_pos.shape[0] == 0:
+            # An empty atlas would launch grid_sample_3d with a zero-sized grid,
+            # which fails as an invalid kernel configuration rather than a no-op.
+            raise RuntimeError(
+                "UV rasterization produced no covered texels; cannot bake a texture. "
+                "The mesh likely has no valid UV unwrap."
+            )
         attrs[mask] = grid_sample_3d(
             attr_volume,
             torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
             shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
             grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
             mode='trilinear',
-        )      
+        )
         
         # --- Texture Post-Processing & Material Construction ---
         print("Finalizing mesh...")
@@ -1556,6 +1744,18 @@ class Trellis2_GGUFMeshWithVoxelMultiViewGenerator:
         right_image=None):
 
         CUDAUtils.reset()
+
+        # Official Pixal3D MultiView is cascade-only.
+        # The 512 model is the LR stage, not a final-decode pipeline.
+        if getattr(pipeline, "isPixal3DMV", False):
+            if pipeline_type in ("512", "1024"):
+                print(
+                    f"[Pixal3D-GGUF-MV] pipeline_type={pipeline_type} "
+                    "is not an official final pipeline; "
+                    "forcing 1024_cascade"
+                )
+                pipeline_type = "1024_cascade"
+
         
         # Convert front image tensor to PIL
         front_pil = ImageUtils.tensor_to_pil(front_image)
@@ -1563,15 +1763,589 @@ class Trellis2_GGUFMeshWithVoxelMultiViewGenerator:
         # Convert optional view image tensors to PIL
         back_pil = ImageUtils.tensor_to_pil(back_image) if back_image is not None else None
         left_pil = ImageUtils.tensor_to_pil(left_image) if left_image is not None else None
-        right_pil = ImageUtils.tensor_to_pil(right_image) if right_image is not None else None        
+        right_pil = ImageUtils.tensor_to_pil(right_image) if right_image is not None else None
+
+        # Fail before model loading if an official MV workflow has already
+        # reframed its views independently upstream.  This is the exact
+        # signature produced by the legacy Trellis2PreProcessImage node:
+        # four different square canvas sizes after per-view bbox crops.
+        if (
+            getattr(pipeline, "isPixal3DMV", False)
+            and os.environ.get(
+                "TRELLIS2_PIXAL3D_MV_INPUT_GUARD", "1"
+            ) == "1"
+        ):
+            _named_raw_views = {
+                "front": front_pil,
+                "left": left_pil,
+                "back": back_pil,
+                "right": right_pil,
+            }
+            _raw_sizes = {
+                _name: _im.size
+                for _name, _im in _named_raw_views.items()
+                if _im is not None
+            }
+            print(
+                "[Pixal3D MV INPUT GUARD] incoming canvases: "
+                + ", ".join(
+                    f"{_name}={_size[0]}x{_size[1]}"
+                    for _name, _size in _raw_sizes.items()
+                )
+            )
+            if len(set(_raw_sizes.values())) > 1:
+                raise RuntimeError(
+                    "[Pixal3D MV INPUT GUARD] Official multi-view inputs "
+                    "arrived with different canvas sizes. This indicates "
+                    "per-view cropping/rescaling before camera projection. "
+                    "Bypass Trellis2PreProcessImage and connect each "
+                    "LoadImageWithTransparency image_with_alpha output "
+                    "directly to the MV generator, OR launch with "
+                    "TRELLIS2_PIXAL3D_MV_PRESERVE_FRAME=1 so legacy "
+                    "PreProcess nodes keep the original canvas. Got: "
+                    + ", ".join(
+                        f"{_name}={_size[0]}x{_size[1]}"
+                        for _name, _size in _raw_sizes.items()
+                    )
+                )
+
+        # ========================================================
+        # Official Pixal3D MV input preparation
+        #
+        # ComfyUI IMAGE normally carries RGB while transparency is
+        # exposed separately as MASK. Therefore IMAGE -> PIL often
+        # arrives here fully opaque even when the original PNG had
+        # transparency.
+        #
+        # Official Pixal3D MV expects foreground-matted RGBA views
+        # and conditions on RGB * alpha over black.
+        #
+        # IMPORTANT: do not crop or reframe here. The camera rig
+        # must remain aligned with the original image framing.
+        # ========================================================
+        if (
+            getattr(pipeline, "isPixal3DMV", False)
+            or getattr(pipeline, "isPixal3D", False)
+        ):
+            import io
+            from rembg import remove as _pixal_rembg
+
+            _debug_dir = (
+                Path(folder_paths.get_output_directory())
+                / "_pixal3d_mv_debug"
+            )
+            _debug_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            def _prepare_pixal3d_mv_view(_im, _name):
+                if _im is None:
+                    return None
+
+                _rgba = _im.convert("RGBA")
+
+                _a0 = np.asarray(
+                    _rgba.getchannel("A"),
+                    dtype=np.uint8,
+                )
+
+                # A useful matte has both foreground and background.
+                _has_useful_alpha = bool(
+                    _a0.min() < 250
+                    and _a0.max() > 5
+                )
+
+                if not _has_useful_alpha:
+                    print(
+                        f"[Pixal3D MV input] {_name}: "
+                        "opaque/no useful alpha -> rembg"
+                    )
+
+                    _cut = _pixal_rembg(
+                        _im.convert("RGB")
+                    )
+
+                    if isinstance(
+                        _cut,
+                        (bytes, bytearray),
+                    ):
+                        _cut = Image.open(
+                            io.BytesIO(_cut)
+                        )
+                    elif isinstance(_cut, np.ndarray):
+                        _cut = Image.fromarray(_cut)
+
+                    _rgba = _cut.convert("RGBA")
+
+                else:
+                    print(
+                        f"[Pixal3D MV input] {_name}: "
+                        "existing alpha retained"
+                    )
+
+                _arr = np.asarray(_rgba)
+                _alpha = _arr[..., 3]
+
+                _fg = _alpha > 128
+                _coverage = float(_fg.mean())
+
+                if _fg.any():
+                    _ys, _xs = np.nonzero(_fg)
+                    _bbox = (
+                        int(_xs.min()),
+                        int(_ys.min()),
+                        int(_xs.max()),
+                        int(_ys.max()),
+                    )
+                else:
+                    _bbox = None
+
+                print(
+                    f"[Pixal3D MV input] {_name}: "
+                    f"size={_rgba.size}, "
+                    f"alpha_coverage={_coverage:.4f}, "
+                    f"bbox={_bbox}"
+                )
+
+                # Actual RGBA matte.
+                _rgba.save(
+                    _debug_dir / f"{_name}_rgba.png"
+                )
+
+                # Exact conditioning appearance:
+                # RGB premultiplied by alpha onto black.
+                _rgb = (
+                    np.asarray(
+                        _rgba.convert("RGB"),
+                        dtype=np.float32,
+                    )
+                    / 255.0
+                )
+
+                _af = (
+                    _alpha.astype(np.float32)
+                    / 255.0
+                )[..., None]
+
+                _cond = np.clip(
+                    _rgb * _af * 255.0,
+                    0,
+                    255,
+                ).astype(np.uint8)
+
+                Image.fromarray(_cond).save(
+                    _debug_dir
+                    / f"{_name}_conditioning.png"
+                )
+
+                Image.fromarray(_alpha).save(
+                    _debug_dir
+                    / f"{_name}_mask.png"
+                )
+
+                return _rgba
+
+            front_pil = _prepare_pixal3d_mv_view(
+                front_pil, "front"
+            )
+            left_pil = _prepare_pixal3d_mv_view(
+                left_pil, "left"
+            )
+            back_pil = _prepare_pixal3d_mv_view(
+                back_pil, "back"
+            )
+            right_pil = _prepare_pixal3d_mv_view(
+                right_pil, "right"
+            )
+
+
+            # =====================================================
+            # Legacy per-view rig normalization.
+            #
+            # IMPORTANT for official Pixal3D MV: the camera-projected
+            # conditioner assumes that every view keeps the framing of
+            # the camera that produced it.  Independently scaling and
+            # recentering front/left/back/right changes that projection
+            # geometry even when all four canvases have the same size.
+            #
+            # v4.10 therefore enables strict framing by default for the
+            # official MV pipeline and ignores an old
+            # TRELLIS2_MV_RIG_NORMALIZE=1 left in a launch script.
+            # Set TRELLIS2_PIXAL3D_MV_STRICT_FRAMING=0 only to reproduce
+            # the legacy normalization path deliberately.
+            # =====================================================
+            _rig_requested = (
+                os.environ.get(
+                    "TRELLIS2_MV_RIG_NORMALIZE", "0"
+                ) == "1"
+            )
+            _strict_mv_framing = (
+                getattr(pipeline, "isPixal3DMV", False)
+                and os.environ.get(
+                    "TRELLIS2_PIXAL3D_MV_STRICT_FRAMING", "1"
+                ) == "1"
+            )
+
+            if _strict_mv_framing and _rig_requested:
+                print(
+                    "[Pixal3D MV strict framing] ignoring "
+                    "TRELLIS2_MV_RIG_NORMALIZE=1; official camera "
+                    "projection requires the four input canvases to "
+                    "remain unscaled and unrecentered"
+                )
+
+            if _rig_requested and not _strict_mv_framing:
+
+                _rig_views = {
+                    "front": front_pil,
+                    "left": left_pil,
+                    "back": back_pil,
+                    "right": right_pil,
+                }
+
+                def _rig_stats(_im):
+                    _a = np.asarray(
+                        _im.convert("RGBA").getchannel("A")
+                    )
+
+                    _ys, _xs = np.nonzero(_a > 128)
+
+                    if len(_xs) == 0:
+                        raise RuntimeError(
+                            "Pixal3D MV view has an empty alpha mask"
+                        )
+
+                    _x0 = int(_xs.min())
+                    _x1 = int(_xs.max())
+                    _y0 = int(_ys.min())
+                    _y1 = int(_ys.max())
+
+                    _bw = _x1 - _x0 + 1
+                    _bh = _y1 - _y0 + 1
+
+                    return {
+                        "bbox": (_x0, _y0, _x1, _y1),
+                        "fill_w": _bw / float(_im.width),
+                        "fill_h": _bh / float(_im.height),
+                    }
+
+                _before = {
+                    _n: _rig_stats(_im)
+                    for _n, _im in _rig_views.items()
+                }
+
+                print(
+                    "[Pixal3D MV rig-normalize] BEFORE:"
+                )
+
+                for _n in (
+                    "front", "left", "back", "right"
+                ):
+                    _st = _before[_n]
+
+                    print(
+                        f"  {_n:5s}: "
+                        f"fill_w={_st['fill_w']:.4f}, "
+                        f"fill_h={_st['fill_h']:.4f}, "
+                        f"bbox={_st['bbox']}"
+                    )
+
+                # Front/back are the reliable reference pair for
+                # object height. Average them to avoid letting one
+                # rembg edge determine the entire rig.
+                _canonical_h = (
+                    _before["front"]["fill_h"]
+                    + _before["back"]["fill_h"]
+                ) * 0.5
+
+                # First make every view represent the same physical
+                # object height.
+                _relative_scale = {
+                    _n: (
+                        _canonical_h
+                        / max(_st["fill_h"], 1e-8)
+                    )
+                    for _n, _st in _before.items()
+                }
+
+                # Find maximum resulting extent after height
+                # normalization.
+                _max_extent = 0.0
+
+                for _n, _st in _before.items():
+                    _sc = _relative_scale[_n]
+
+                    _max_extent = max(
+                        _max_extent,
+                        _st["fill_w"] * _sc,
+                        _st["fill_h"] * _sc,
+                    )
+
+                # Official Pixal3D MV example camera has a 1.1x
+                # framing margin, i.e. about 90.91% maximum object
+                # fill in the image.
+                _target_fill = float(
+                    os.environ.get(
+                        "TRELLIS2_MV_RIG_TARGET_FILL",
+                        str(1.0 / 1.1),
+                    )
+                )
+
+                if not (0.1 < _target_fill < 1.0):
+                    raise ValueError(
+                        "TRELLIS2_MV_RIG_TARGET_FILL must "
+                        "be between 0.1 and 1.0"
+                    )
+
+                _global_scale = (
+                    _target_fill
+                    / max(_max_extent, 1e-8)
+                )
+
+                _final_scale = {
+                    _n: (
+                        _relative_scale[_n]
+                        * _global_scale
+                    )
+                    for _n in _rig_views
+                }
+
+                def _scale_object_centered(
+                    _im,
+                    _scale,
+                ):
+                    _im = _im.convert("RGBA")
+                    _alpha = _im.getchannel("A")
+
+                    # Preserve all antialias/soft alpha pixels in
+                    # the crop, not only the >128 diagnostic mask.
+                    _bbox = _alpha.getbbox()
+
+                    if _bbox is None:
+                        raise RuntimeError(
+                            "Cannot normalize empty Pixal3D mask"
+                        )
+
+                    _crop = _im.crop(_bbox)
+
+                    _nw = max(
+                        1,
+                        int(round(_crop.width * _scale))
+                    )
+                    _nh = max(
+                        1,
+                        int(round(_crop.height * _scale))
+                    )
+
+                    _crop = _crop.resize(
+                        (_nw, _nh),
+                        Image.Resampling.LANCZOS,
+                    )
+
+                    _canvas = Image.new(
+                        "RGBA",
+                        _im.size,
+                        (0, 0, 0, 0),
+                    )
+
+                    # Center the foreground itself, eliminating
+                    # small independent composition offsets.
+                    _x = (_im.width - _nw) // 2
+                    _y = (_im.height - _nh) // 2
+
+                    _canvas.alpha_composite(
+                        _crop,
+                        (_x, _y),
+                    )
+
+                    return _canvas
+
+                for _n in (
+                    "front", "left", "back", "right"
+                ):
+                    _rig_views[_n] = (
+                        _scale_object_centered(
+                            _rig_views[_n],
+                            _final_scale[_n],
+                        )
+                    )
+
+                front_pil = _rig_views["front"]
+                left_pil = _rig_views["left"]
+                back_pil = _rig_views["back"]
+                right_pil = _rig_views["right"]
+
+                _after = {
+                    _n: _rig_stats(_im)
+                    for _n, _im in _rig_views.items()
+                }
+
+                print(
+                    "[Pixal3D MV rig-normalize] "
+                    f"canonical_h={_canonical_h:.4f}, "
+                    f"target_max_fill={_target_fill:.4f}"
+                )
+
+                print(
+                    "[Pixal3D MV rig-normalize] scales:"
+                )
+
+                for _n in (
+                    "front", "left", "back", "right"
+                ):
+                    print(
+                        f"  {_n:5s}: "
+                        f"{_final_scale[_n]:.4f}"
+                    )
+
+                print(
+                    "[Pixal3D MV rig-normalize] AFTER:"
+                )
+
+                _rig_debug = (
+                    _debug_dir / "rig_normalized"
+                )
+                _rig_debug.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                for _n in (
+                    "front", "left", "back", "right"
+                ):
+                    _im = _rig_views[_n]
+                    _st = _after[_n]
+
+                    print(
+                        f"  {_n:5s}: "
+                        f"fill_w={_st['fill_w']:.4f}, "
+                        f"fill_h={_st['fill_h']:.4f}, "
+                        f"bbox={_st['bbox']}"
+                    )
+
+                    _im.save(
+                        _rig_debug
+                        / f"{_n}_rgba.png"
+                    )
+
+                    _arr = np.asarray(_im)
+                    _rgb = _arr[..., :3].astype(
+                        np.float32
+                    )
+                    _af = (
+                        _arr[..., 3:4].astype(
+                            np.float32
+                        )
+                        / 255.0
+                    )
+
+                    _cond = np.clip(
+                        _rgb * _af,
+                        0,
+                        255,
+                    ).astype(np.uint8)
+
+                    Image.fromarray(_cond).save(
+                        _rig_debug
+                        / f"{_n}_conditioning.png"
+                    )
+
+                print(
+                    "[Pixal3D MV rig-normalize] "
+                    "corrected inputs saved to "
+                    + str(_rig_debug)
+                )
+
+            print(
+                "[Pixal3D MV input] debug views saved to "
+                + str(_debug_dir)
+            )
+
+            # Optional diagnostic mode: stop BEFORE the expensive
+            # Pixal3D generation so the prepared views can be checked.
+            if os.environ.get(
+                "TRELLIS2_MV_DEBUG_INPUT_STOP", "0"
+            ) == "1":
+                raise RuntimeError(
+                    "[Pixal3D MV input] debug-only stop requested"
+                )
         
-        sparse_structure_guidance_interval = [sparse_structure_guidance_interval_start,sparse_structure_guidance_interval_end]
-        shape_guidance_interval = [shape_guidance_interval_start,shape_guidance_interval_end]
-        texture_guidance_interval = [texture_guidance_interval_start,texture_guidance_interval_end]
         
-        sparse_structure_sampler_params = {"steps":sparse_structure_steps,"guidance_strength":sparse_structure_guidance_strength,"guidance_rescale":sparse_structure_guidance_rescale,"guidance_interval":sparse_structure_guidance_interval,"rescale_t":sparse_structure_rescale_t}        
-        shape_slat_sampler_params = {"steps":shape_steps,"guidance_strength":shape_guidance_strength,"guidance_rescale":shape_guidance_rescale,"guidance_interval":shape_guidance_interval,"rescale_t":shape_rescale_t}       
-        tex_slat_sampler_params = {"steps":texture_steps,"guidance_strength":texture_guidance_strength,"guidance_rescale":texture_guidance_rescale,"guidance_interval":texture_guidance_interval,"rescale_t":texture_rescale_t}
+        # Official Pixal3D MV inference only overrides steps / guidance strength /
+        # guidance rescale / rescale_t.  It does not inject guidance_interval and
+        # does not replace the pipeline-configured sampler object.  The released
+        # *_mv checkpoints should be tested with those exact semantics by default.
+        _official_mv_sampler_semantics = (
+            os.environ.get(
+                "TRELLIS2_PIXAL3D_MV_OFFICIAL_SAMPLERS",
+                "1",
+            ) == "1"
+        )
+
+        if _official_mv_sampler_semantics:
+            sparse_structure_sampler_params = {
+                "steps": sparse_structure_steps,
+                "guidance_strength": sparse_structure_guidance_strength,
+                "guidance_rescale": sparse_structure_guidance_rescale,
+                "rescale_t": sparse_structure_rescale_t,
+            }
+            shape_slat_sampler_params = {
+                "steps": shape_steps,
+                "guidance_strength": shape_guidance_strength,
+                "guidance_rescale": shape_guidance_rescale,
+                "rescale_t": shape_rescale_t,
+            }
+            tex_slat_sampler_params = {
+                "steps": texture_steps,
+                "guidance_strength": texture_guidance_strength,
+                "guidance_rescale": texture_guidance_rescale,
+                "rescale_t": texture_rescale_t,
+            }
+            _ss_sampler_arg = None
+            _shape_sampler_arg = None
+            _tex_sampler_arg = None
+            print(
+                "[Pixal3D MV official sampler] using pipeline-configured samplers; "
+                "guidance_interval overrides disabled"
+            )
+        else:
+            sparse_structure_guidance_interval = [
+                sparse_structure_guidance_interval_start,
+                sparse_structure_guidance_interval_end,
+            ]
+            shape_guidance_interval = [
+                shape_guidance_interval_start,
+                shape_guidance_interval_end,
+            ]
+            texture_guidance_interval = [
+                texture_guidance_interval_start,
+                texture_guidance_interval_end,
+            ]
+            sparse_structure_sampler_params = {
+                "steps": sparse_structure_steps,
+                "guidance_strength": sparse_structure_guidance_strength,
+                "guidance_rescale": sparse_structure_guidance_rescale,
+                "guidance_interval": sparse_structure_guidance_interval,
+                "rescale_t": sparse_structure_rescale_t,
+            }
+            shape_slat_sampler_params = {
+                "steps": shape_steps,
+                "guidance_strength": shape_guidance_strength,
+                "guidance_rescale": shape_guidance_rescale,
+                "guidance_interval": shape_guidance_interval,
+                "rescale_t": shape_rescale_t,
+            }
+            tex_slat_sampler_params = {
+                "steps": texture_steps,
+                "guidance_strength": texture_guidance_strength,
+                "guidance_rescale": texture_guidance_rescale,
+                "guidance_interval": texture_guidance_interval,
+                "rescale_t": texture_rescale_t,
+            }
+            _ss_sampler_arg = sparse_structure_sampler
+            _shape_sampler_arg = shape_sampler
+            _tex_sampler_arg = texture_sampler
             
         if generate_texture_slat:
             num_steps = 5
@@ -1598,9 +2372,9 @@ class Trellis2_GGUFMeshWithVoxelMultiViewGenerator:
             front_axis=front_axis,
             blend_temperature=blend_temperature,
             sampler=None,
-            sparse_structure_sampler=sparse_structure_sampler,
-            shape_sampler=shape_sampler,
-            tex_sampler=texture_sampler
+            sparse_structure_sampler=_ss_sampler_arg,
+            shape_sampler=_shape_sampler_arg,
+            tex_sampler=_tex_sampler_arg
         )[0]         
         
         vertices = mesh.vertices.cuda()
@@ -1839,17 +2613,19 @@ class Trellis2_GGUFPostProcessAndUnWrapAndRasterizer:
             out_vertices, out_faces = cumesh.read()
             out_vertices = out_vertices.cuda()
             out_faces = out_faces.cuda()
-            cumesh.compute_vertex_normals()
-            out_normals = cumesh.read_vertex_normals()
-            
-            # Map vertex positions back to original mesh for accurate attribute sampling
-            # Use BVH to find the closest point on original mesh surface for more accurate colors
-            _, face_id, uvw = bvh.unsigned_distance(out_vertices, return_uvw=True)
-            orig_tri_verts = bvh.vertices[bvh.faces[face_id.long()]]  # (N_verts, 3, 3)
-            mapped_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
-            
-            # Sample attributes at mapped positions from the voxel grid
-            vertex_attrs = grid_sample_3d(
+            if use_safe_vertex_bake():
+                # Skips cuBVH/cumesh/flex_gemm HIP kernels; vertices sampled in place
+                print('[Trellis2] ROCm safe vertex bake (CPU sampling)')
+                out_normals = vertex_normals_cpu(out_vertices, out_faces)
+                vertex_attrs = sparse_trilinear_cpu(attr_volume, coords, grid_size.tolist(),
+                                                    (out_vertices - aabb[0]) / voxel_size)
+            else:
+              cumesh.compute_vertex_normals()
+              out_normals = cumesh.read_vertex_normals()
+              _, face_id, uvw = bvh.unsigned_distance(out_vertices, return_uvw=True)
+              orig_tri_verts = bvh.vertices[bvh.faces[face_id.long()]]  # (N_verts, 3, 3)
+              mapped_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+              vertex_attrs = grid_sample_3d(
                 attr_volume,
                 torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
                 shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
@@ -1983,40 +2759,35 @@ class Trellis2_GGUFPostProcessAndUnWrapAndRasterizer:
         out_normals = cumesh.read_vertex_normals()[out_vmaps]        
 
         print("Sampling attributes...")
-        # Setup differentiable rasterizer context
-        ctx = dr.RasterizeCudaContext()
-        # Prepare UV coordinates for rasterization (rendering in UV space)
-        uvs_rast = torch.cat([out_uvs * 2 - 1, torch.zeros_like(out_uvs[:, :1]), torch.ones_like(out_uvs[:, :1])], dim=-1).unsqueeze(0)
-        rast = torch.zeros((1, texture_size, texture_size, 4), device='cuda', dtype=torch.float32)
-        
-        # Rasterize in chunks to save memory
+        # Rasterize the UV atlas. nvdiffrast's rasterizer is CUDA-only and every
+        # HIP port of it currently mis-rasterizes, so this is done in torch.
         out_faces_int32 = out_faces.to(torch.int32)
-        for i in range(0, out_faces_int32.shape[0], 100000):
-            rast_chunk, _ = dr.rasterize(
-                ctx, uvs_rast, out_faces_int32[i:i+100000],
-                resolution=[texture_size, texture_size],
-            )
-            mask_chunk = rast_chunk[..., 3:4] > 0
-            rast_chunk[..., 3:4] += i # Store face ID in alpha channel
-            rast = torch.where(mask_chunk, rast_chunk, rast)
-        
+        rast_face_id, rast_bary = rasterize_uv(out_uvs, out_faces_int32, texture_size)
+
         # Mask of valid pixels in texture
-        mask = rast[0, ..., 3] > 0
-        
+        mask = rast_face_id > 0
+
         # Interpolate 3D positions in UV space (finding 3D coord for every texel)
-        pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces_int32)[0][0]
+        pos = interpolate_uv(out_vertices, rast_face_id, rast_bary, out_faces_int32)
         valid_pos = pos[mask]
-        
+
         # Map these positions back to the *original* high-res mesh to get accurate attributes
         # This corrects geometric errors introduced by simplification/remeshing
         _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
         orig_tri_verts = bvh.vertices[bvh.faces[face_id.long()]] # (N_new, 3, 3)
-        valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)        
-        
+        valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+
         torch.cuda.synchronize()
-        
+
         # Trilinear sampling from the attribute volume (Color, Material props)
         attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device='cuda')
+        if valid_pos.shape[0] == 0:
+            # An empty atlas would launch grid_sample_3d with a zero-sized grid,
+            # which fails as an invalid kernel configuration rather than a no-op.
+            raise RuntimeError(
+                "UV rasterization produced no covered texels; cannot bake a texture. "
+                "The mesh likely has no valid UV unwrap."
+            )
         attrs[mask] = grid_sample_3d(
             attr_volume,
             torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
@@ -2024,7 +2795,7 @@ class Trellis2_GGUFPostProcessAndUnWrapAndRasterizer:
             grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
             mode='trilinear',
         )
-        
+
         # --- Texture Post-Processing & Material Construction ---
         print("Finalizing mesh...")
         pbar.update(1)
@@ -2550,11 +3321,38 @@ class Trellis2_GGUFPreProcessImage:
 
     def process(self, image, padding, remove_background):
         image = ImageUtils.tensor_to_pil(image)
-        
+
+        if not remove_background and not self.has_usable_alpha(image):
+            print("[Trellis2-GGUF] Input image has no usable alpha; running background removal.")
+            remove_background = True
+
         if remove_background:
             from rembg import remove
-            image = remove(image)
-        
+            image = remove(image.convert("RGB"))
+
+        # Official Pixal3D multi-view cameras are defined against the
+        # ORIGINAL image canvas.  The legacy PreProcess node crops each
+        # view to its alpha bbox (and then adds padding), which destroys
+        # that camera/framing relationship when it is inserted before an
+        # official MV generator.  Compatibility mode keeps old workflows
+        # usable without silently reframing each camera independently.
+        if os.environ.get(
+            "TRELLIS2_PIXAL3D_MV_PRESERVE_FRAME", "0"
+        ) == "1":
+            image = image.convert("RGBA")
+            if padding:
+                print(
+                    "[Pixal3D MV preserve-frame] ignoring legacy "
+                    f"PreProcess padding={padding}; preserving original "
+                    f"canvas {image.width}x{image.height}"
+                )
+            print(
+                "[Pixal3D MV preserve-frame] PreProcess compatibility "
+                f"mode: full RGBA canvas retained ({image.width}x{image.height}); "
+                "crop/rescale disabled"
+            )
+            return (ImageUtils.pil_to_tensor(image),)
+
         image = self.preprocess_image(image)
         
         if padding>0:
@@ -2565,6 +3363,12 @@ class Trellis2_GGUFPreProcessImage:
         image = ImageUtils.pil_to_tensor(image)
         
         return (image,)    
+
+    @staticmethod
+    def has_usable_alpha(img: Image.Image) -> bool:
+        if img.mode != "RGBA":
+            return False
+        return not np.all(np.array(img)[:, :, 3] == 255)
 
     def parse_fill_for_image(self, fill: str, img):
         values = [int(x.strip()) for x in fill.split(",")]
@@ -2606,8 +3410,18 @@ class Trellis2_GGUFPreProcessImage:
                 # self.rembg_model.cpu()
         output = input
         output_np = np.array(output)
+        if output_np.ndim != 3 or output_np.shape[2] != 4:
+            raise ValueError(
+                "PreProcessImage needs an RGBA image with an alpha channel; got "
+                f"mode={output.mode}. Enable remove_background or supply a cutout PNG."
+            )
         alpha = output_np[:, :, 3]
         bbox = np.argwhere(alpha > 0.8 * 255)
+        if bbox.size == 0:
+            raise ValueError(
+                "Background removal left no foreground (alpha is empty). "
+                "Use an image with a clear subject."
+            )
         bbox = np.min(bbox[:, 1]), np.min(bbox[:, 0]), np.max(bbox[:, 1]), np.max(bbox[:, 0])
         center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
         size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
@@ -3903,6 +4717,7 @@ class Trellis2_GGUFSimplifyTrimeshAdvanced:
         return (new_mesh,)
 
 NODE_CLASS_MAPPINGS = {
+    "Trellis2LoadPixal3DMV_GGUF": Trellis2_Pixal3DMVGGUFLoadModel,
     "Trellis2LoadModel_GGUF": Trellis2_GGUFLoadModel,
     "Trellis2MeshWithVoxelGenerator_GGUF": Trellis2_GGUFMeshWithVoxelGenerator,
     "Trellis2LoadImageWithTransparency_GGUF": Trellis2_GGUFLoadImageWithTransparency,
@@ -3952,6 +4767,7 @@ NODE_CLASS_MAPPINGS = {
     
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "Trellis2LoadPixal3DMV_GGUF": "Pixal3D - Official MultiView LoadModel (GGUF)",
     "Trellis2LoadModel_GGUF": "Trellis2 - LoadModel (GGUF)",
     "Trellis2MeshWithVoxelGenerator_GGUF": "Trellis2 - Mesh With Voxel Generator (GGUF)",
     "Trellis2LoadImageWithTransparency_GGUF": "Trellis2 - Load Image with Transparency (GGUF)",

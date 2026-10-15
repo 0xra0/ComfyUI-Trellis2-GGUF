@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 import torch.nn as nn
 from .. import SparseTensor
@@ -41,8 +42,22 @@ def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
     # check if neighbor map is already computed
     Co, Kd, Kh, Kw, Ci = self.weight.shape
     neighbor_cache_key = f'SubMConv3d_neighbor_cache_{Kw}x{Kh}x{Kd}_dilation{self.dilation}'
-    neighbor_cache = x.get_spatial_cache(neighbor_cache_key)
-    
+    # RDNA2 / ROCm safety mode:
+    # decoder topology changes repeatedly during subdivision.  Reusing a
+    # FlexGEMM neighbour map created for an older sparse layout can result
+    # in an asynchronous HIP illegal-memory-access instead of a Python
+    # exception.
+    _rocm_safe = (
+        os.environ.get("TRELLIS2_ROCM_SAFE_DECODER", "0") == "1"
+        and getattr(torch.version, "hip", None) is not None
+    )
+
+    neighbor_cache = (
+        None
+        if _rocm_safe
+        else x.get_spatial_cache(neighbor_cache_key)
+    )
+
     out, neighbor_cache_ = sparse_submanifold_conv3d(
         x.feats,
         x.coords,
@@ -52,9 +67,12 @@ def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
         neighbor_cache,
         self.dilation
     )
-    
-    if neighbor_cache is None:
-        x.register_spatial_cache(neighbor_cache_key, neighbor_cache_)
+
+    if neighbor_cache is None and not _rocm_safe:
+        x.register_spatial_cache(
+            neighbor_cache_key,
+            neighbor_cache_,
+        )
     
     out = x.replace(out)
     return out
